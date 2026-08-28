@@ -1,8 +1,8 @@
-# OpenMV -> STM32 USART2 visual protocol.
-# Frame: V,detected,x_offset_px,y_offset_px,distance_cm,object_type\n
+# OpenMV -> STM32 USART2 visual transmission test.
+# Frame: V,color,cx,cy,distance_cm\n
+# color: 0=none, 1=red, 2=yellow.
 
 import sensor
-import image
 import time
 from pyb import LED, UART
 
@@ -17,24 +17,21 @@ RED_TYPE = 1
 YELLOW_TYPE = 2
 
 
-def send_target(detected, x_offset_px, y_offset_px, distance_cm, object_type):
-    uart.write("V,%d,%d,%d,%d,%d\n" % (
-        detected,
-        x_offset_px,
-        y_offset_px,
+def send_target(color, cx, cy, distance_cm):
+    uart.write("V,%d,%d,%d,%d\n" % (
+        color,
+        cx,
+        cy,
         distance_cm,
-        object_type,
     ))
 
 
-def largest_blob(blobs):
-    if not blobs:
-        return None
-
-    target = blobs[0]
-    for blob in blobs:
-        if blob.pixels() > target.pixels():
-            target = blob
+def largest_blob(candidates):
+    """Return (blob, color config) having the largest pixel count."""
+    target = None
+    for candidate in candidates:
+        if target is None or candidate[0].pixels() > target[0].pixels():
+            target = candidate
     return target
 
 sensor.reset()
@@ -82,9 +79,11 @@ clock = time.clock()
 while True:
     clock.tick()
     img = sensor.snapshot()
-    detected_count = 0
+    candidates = []
+    led = LED(2)
+    led.on()
 
-    # Detect each color separately so nearby colors are not merged together.
+    # Detect each color separately, then select one global largest valid blob.
     for object_type, color_name, threshold, box_color, known_width_mm in color_configs:
         blobs = img.find_blobs(
             [threshold],
@@ -95,13 +94,8 @@ while True:
         )
 
         for blob in blobs:
-            x = blob.x
-            y = blob.y
-            w = blob.w
-            h = blob.h
-            cx = blob.cx
-            cy = blob.cy
-            width_px = w
+            w = blob.w()
+            h = blob.h()
 
             if w < MIN_BLOB_WIDTH or h < MIN_BLOB_HEIGHT:
                 continue
@@ -110,31 +104,36 @@ while True:
             if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
                 continue
 
-            # A solid block fills most of its bounding box; a wire usually does not.
+            candidates.append((
+                blob,
+                object_type,
+                color_name,
+                box_color,
+                known_width_mm,
+            ))
 
-            distance_mm = (FOCAL_LENGTH_PX * known_width_mm) / width_px
-            distance_cm = int(distance_mm / 10.0)
-            detected_count += 1
-
-            img.draw_rectangle((x, y, w, h), color=box_color, thickness=2)
-            bottom_center_x = x + (w // 2)
-            bottom_center_y = min(y + h - 1, 239)
-            img.draw_cross(
-                (bottom_center_x, bottom_center_y),
-                color=box_color,
-                size=5,
-                thickness=2,
-            )
-
-            label_y = max(y - 12, 0)
-            label = "%s %.1fmm" % (color_name, distance_mm)
-            img.draw_string((x, label_y), label, color=box_color, scale=1)
-
-            x_offset_px = cx - (IMAGE_WIDTH // 2)
-            y_offset_px = cy - (IMAGE_HEIGHT // 2)
-            print(color_name, x_offset_px, y_offset_px, distance_cm)
-            send_target(1, x_offset_px, y_offset_px, distance_cm, object_type)
-
-    if detected_count == 0:
+    target = largest_blob(candidates)
+    if target is None:
         print("No red or yellow block found")
-        send_target(0, 0, 0, 0, 0)
+        send_target(0, 0, 0, 0)
+        continue
+
+    blob, object_type, color_name, box_color, known_width_mm = target
+    x = blob.x()
+    y = blob.y()
+    w = blob.w()
+    h = blob.h()
+    cx = blob.cx()
+    cy = blob.cy()
+
+    distance_mm = (FOCAL_LENGTH_PX * known_width_mm) / w
+    distance_cm = int(distance_mm / 10.0)
+
+    img.draw_rectangle(blob.rect(), color=box_color, thickness=2)
+    img.draw_cross((cx, cy), color=box_color, size=5, thickness=2)
+    label_y = max(y - 12, 0)
+    label = "%s %.1fmm" % (color_name, distance_mm)
+    img.draw_string((x, label_y), label, color=box_color, scale=1)
+
+    print("TX", object_type, cx, cy, distance_cm)
+    send_target(object_type, cx, cy, distance_cm)
