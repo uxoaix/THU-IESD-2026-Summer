@@ -5,7 +5,7 @@
 
 /*
  * 四轮电气与机械参数。FR/FL是早期单轮调试遗留模块名；
- * 整车运动学映射统一为：PE9=左前、PE11=左后、PE13=右前、PE14=右后。
+ * 实车运动学映射统一为：PE9=右前、PE11=右后、PE13=左前、PE14=左后。
  *
  * 依据 1：《智能机电小车 STM32F103VET6 电气连接总表 Rev V7.0》
  * 依据 2：《实验材料说明》第 13/14/16 章（L298N、12V 280rpm 编码电机、12V 电池）
@@ -32,7 +32,7 @@
  * OpenMV —— USART2，115200 8N1，PA2 = TX / PA3 = RX
  */
 
-/* ---- 左前轮：TIM1_CH1 / PE9（遗留模块名FR） ---- */
+/* ---- 实车右前轮：TIM1_CH1 / PE9（遗留模块名FR） ---- */
 #define FR_PWM_TIM              (&htim1)
 #define FR_PWM_CHANNEL          TIM_CHANNEL_1
 #define FR_PWM_PORT             GPIOE
@@ -46,9 +46,9 @@
 #define FR_IN1_PIN              GPIO_PIN_0
 #define FR_IN2_PORT             GPIOE
 #define FR_IN2_PIN              GPIO_PIN_1
-#define FR_DRIVE_SIGN           (+1)
+#define FR_DRIVE_SIGN           (-1)
 
-/* ---- 左后轮：TIM1_CH2 / PE11（遗留模块名FL），PE2/PE3方向 ---- */
+/* ---- 实车右后轮：TIM1_CH2 / PE11（遗留模块名FL），PE2/PE3方向 ---- */
 #define FL_PWM_TIM              (&htim1)
 #define FL_PWM_CHANNEL          TIM_CHANNEL_2
 #define FL_PWM_PORT             GPIOE
@@ -58,10 +58,10 @@
 #define FL_IN1_PIN              GPIO_PIN_2
 #define FL_IN2_PORT             GPIOE
 #define FL_IN2_PIN              GPIO_PIN_3
-/* 若左轮因镜像安装导致车辆前进方向相反，只把这里改为-1 */
-#define FL_DRIVE_SIGN           (-1)
+/* PE9/PE11 位于实车同一侧；按实测反转这一路的电机输出极性。 */
+#define FL_DRIVE_SIGN           (+1)
 
-/* ---- 右前轮：PE13/TIM1_CH3，PE4/PE5方向，TIM5编码器 ---- */
+/* ---- 实车左前轮：PE13/TIM1_CH3，PE4/PE5方向，TIM5编码器 ---- */
 #define PE13_PWM_TIM            (&htim1)
 #define PE13_PWM_CHANNEL        TIM_CHANNEL_3
 #define PE13_PWM_PORT           GPIOE
@@ -74,7 +74,7 @@
 #define PE13_ENC_TIM            (&htim5)
 #define PE13_ENC_SIGN           (-1)
 
-/* ---- 右后轮：PE14/TIM1_CH4，PE6/PE7方向，TIM8编码器 ---- */
+/* ---- 实车左后轮：PE14/TIM1_CH4，PE6/PE7方向，TIM8编码器 ---- */
 #define PE14_PWM_TIM            (&htim1)
 #define PE14_PWM_CHANNEL        TIM_CHANNEL_4
 #define PE14_PWM_PORT           GPIOE

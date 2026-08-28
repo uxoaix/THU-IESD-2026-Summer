@@ -93,11 +93,11 @@ static void HandleBluetooth(uint32_t now)
     case HC05_EVENT_BACKWARD:
       SetManualMotion(-HC05_MANUAL_LINEAR_SPEED_CM_S, 0.0f); break;
     case HC05_EVENT_LEFT:
-      SetManualMotion(HC05_MANUAL_LINEAR_SPEED_CM_S * MANUAL_TURN_LINEAR_RATIO,
-                      HC05_MANUAL_ANGULAR_SPEED_RAD_S); break;
+      SetManualMotion(TIGHT_TURN_LINEAR_SPEED_CM_S,
+                      DEG_TO_RAD(TIGHT_TURN_ANGULAR_SPEED_DEG_S)); break;
     case HC05_EVENT_RIGHT:
-      SetManualMotion(HC05_MANUAL_LINEAR_SPEED_CM_S * MANUAL_TURN_LINEAR_RATIO,
-                      -HC05_MANUAL_ANGULAR_SPEED_RAD_S); break;
+      SetManualMotion(TIGHT_TURN_LINEAR_SPEED_CM_S,
+                      -DEG_TO_RAD(TIGHT_TURN_ANGULAR_SPEED_DEG_S)); break;
     case HC05_EVENT_ROTATE_CW:
       SetManualMotion(0.0f, -HC05_MANUAL_ANGULAR_SPEED_RAD_S); break;
     case HC05_EVENT_ROTATE_CCW:
@@ -140,14 +140,23 @@ static void HandleBluetooth(uint32_t now)
 static void SendTelemetry(uint32_t now)
 {
   FusionState_t fusion;
+  /* 手动停车模式也刷新视觉快照，便于只测试OpenMV→STM32传输。 */
+  OpenMvUart_GetLatest(&s_vision);
   SensorFusion_GetState(&fusion);
   DbgUart_Printf("S,%lu,mode=%u,imu=%u,fused=%u,count=%u,state=%u,"
-                 "det=%u,x=%d,dist=%u,wall=%u\n",
+                 "det=%u,color=%u,cx=%u,cy=%u,xoff=%d,yoff=%d,"
+                 "dist=%u,vision_ok=%lu,vision_bad=%lu,wall=%u\n",
     (unsigned long)now, (unsigned int)s_mode,
     (unsigned int)fusion.imu_alive, (unsigned int)fusion.fused,
     (unsigned int)MotionStrategy_GetCollectedCount(),
     (unsigned int)MotionStrategy_GetState(), (unsigned int)s_vision.detected,
-    (int)s_vision.x_offset_px, (unsigned int)s_vision.distance_cm,
+    (unsigned int)s_vision.object_type,
+    (unsigned int)s_vision.center_x_px,
+    (unsigned int)s_vision.center_y_px,
+    (int)s_vision.x_offset_px, (int)s_vision.y_offset_px,
+    (unsigned int)s_vision.distance_cm,
+    (unsigned long)OpenMvUart_GetValidFrameCount(),
+    (unsigned long)OpenMvUart_GetInvalidFrameCount(),
     (unsigned int)s_wall.distance_cm);
 }
 

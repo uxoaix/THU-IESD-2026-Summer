@@ -135,6 +135,18 @@ void MotionStrategy_Update(const VisionData_t *vision,
     break;
 
   case MOTION_STATE_ROTATE_SEARCH:
+#if OBJECT_APPROACH_TEST_MODE
+    if (wanted_detected) {
+      Enter(MOTION_STATE_PRE_CENTERING);
+    } else {
+      /*
+       * 与蓝牙RIGHT共用同一组紧凑右转参数：
+       * 左侧外轮正转，右侧内轮反转。
+       */
+      Motion_Drive(TIGHT_TURN_LINEAR_SPEED_CM_S,
+                   -DEG_TO_RAD(TIGHT_TURN_ANGULAR_SPEED_DEG_S), out);
+    }
+#else
     if (s_collected >= TOTAL_OBJECTS_TO_COLLECT) {
       Enter(MOTION_STATE_CAMERA_ROTATE);
     } else if (wanted_detected) {
@@ -148,6 +160,7 @@ void MotionStrategy_Update(const VisionData_t *vision,
     } else {
       Motion_Rotate(-DEG_TO_RAD(SEARCH_ROTATION_SPEED_DEG_S), out);
     }
+#endif
     break;
 
   case MOTION_STATE_PRE_CENTERING:
@@ -178,6 +191,22 @@ void MotionStrategy_Update(const VisionData_t *vision,
 
   case MOTION_STATE_BRUSH_COLLECT:
     Motion_StopOutput(out);
+#if OBJECT_APPROACH_TEST_MODE
+    if (s_action_step == 0U) {
+      out->brush_cycle = 1U;
+      s_action_step = 1U;
+    } else if (s_action_step == 1U &&
+               ActuatorServos_IsBusy(ACTUATOR_SERVO_BRUSH)) {
+      s_action_step = 2U;
+    } else if (s_action_step == 2U &&
+               !ActuatorServos_IsBusy(ACTUATOR_SERVO_BRUSH)) {
+      s_collected++;
+      Enter(MOTION_STATE_SEARCH_CONTINUE);
+    }
+    if (s_state_ms >= BRUSH_TIMEOUT_MS) {
+      Enter(MOTION_STATE_SEARCH_CONTINUE);
+    }
+#else
     if (s_action_step == 0U) {
       out->brush_cycle = 1U;
       s_action_step = 1U;
@@ -204,6 +233,7 @@ void MotionStrategy_Update(const VisionData_t *vision,
                       BUCKET_RETURN_MS + COLLECT_BUCKET_DELAY_MS) {
       Enter(MOTION_STATE_SEARCH_CONTINUE);
     }
+#endif
     break;
 
   case MOTION_STATE_SEARCH_CONTINUE:

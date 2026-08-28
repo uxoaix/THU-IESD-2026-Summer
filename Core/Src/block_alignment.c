@@ -96,13 +96,13 @@ float BlockAlignment_GetAngularCorrection(int16_t x_offset_px)
 
     /* 2. 规则表: x 偏左 → ω 正 (左转CCW), x 偏右 → ω 负 (右转CW)
      * 每个档位对应一个固定的输出角速度 (singleton):
-     *   NB → PB (偏左极大 → 大幅左转, +0.5 rad/s)
-     *   NM → PM (偏左中等 → 中等左转, +0.3 rad/s)
-     *   NS → PS (偏左稍小 → 稍微左转, +0.15 rad/s)
+     *   NB → PB (偏左极大 → 大幅左转, +1.0 rad/s)
+     *   NM → PM (偏左中等 → 中等左转, +0.65 rad/s)
+     *   NS → PS (偏左稍小 → 稍微左转, +0.35 rad/s)
      *   ZE → ZE (正中     → 不转,     0 rad/s)
-     *   PS → NS (偏右稍小 → 稍微右转, -0.15 rad/s)
-     *   PM → NM (偏右中等 → 中等右转, -0.3 rad/s)
-     *   PB → NB (偏右极大 → 大幅右转, -0.5 rad/s) */
+     *   PS → NS (偏右稍小 → 稍微右转, -0.35 rad/s)
+     *   PM → NM (偏右中等 → 中等右转, -0.65 rad/s)
+     *   PB → NB (偏右极大 → 大幅右转, -1.0 rad/s) */
     const float sum_mu = mu_NB + mu_NM + mu_NS + mu_ZE + mu_PS + mu_PM + mu_PB;
     /* 除零保护: 所有隶属度都为 0 (输入完全在边界外) → 安全返回 0 */
     if (sum_mu < 1e-6f) {

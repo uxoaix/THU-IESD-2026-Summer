@@ -6,7 +6,8 @@
 
 /*
  * ASCII帧：
- * V,detected,x_offset_px,y_offset_px,distance_cm,object_type\n
+ * V,color,cx,cy,distance_cm\n
+ * color: 0=无目标, 1=红色, 2=黄色, 3=黑区。
  */
 void OpenMvUart_Init(void);
 void OpenMvUart_Process(void);

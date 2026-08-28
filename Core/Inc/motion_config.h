@@ -50,13 +50,21 @@ typedef enum {
 
 /* 上电控制模式: 0=手动，1=自动；运行中可用 MANUAL/AUTO 切换。 */
 #ifndef DEFAULT_CONTROL_MODE
-#define DEFAULT_CONTROL_MODE                1U
+#define DEFAULT_CONTROL_MODE                0U  /* 视觉链路联调阶段默认手动停车 */
 #endif
+
+/*
+ * 前阶段联调：1=仅循环执行搜索物块→对准→接近→滚刷→继续搜索。
+ * 不进入墙扫、后斗、摄像头反转、黑区搜索和卸货流程。
+ */
+#define OBJECT_APPROACH_TEST_MODE         1U
 
 /* 3. 视觉输入数据结构 (OpenMV → STM32)
  *   字段单位在两端保持一致; timestamp_ms 由 STM32 接收时打戳。 */
 typedef struct {
   uint8_t  detected;        /* 1=看到目标, 0=没看到 */
+  uint16_t center_x_px;     /* OpenMV 原始中心坐标, VGA范围 0~639 */
+  uint16_t center_y_px;     /* OpenMV 原始中心坐标, VGA范围 0~479 */
   int16_t  x_offset_px;     /* 目标水平偏移 (像素, 负=左, 正=右, 0=居中) */
   int16_t  y_offset_px;     /* 目标垂直偏移 (像素, 负=上, 正=下) */
   uint16_t distance_cm;     /* 目标距离 (cm) */
@@ -97,23 +105,25 @@ typedef struct {
 #define PRE_CENTERING_TIMEOUT_MS         2000U
 
 /* 8. 速度与运动控制参数 */
-#define MAX_LINEAR_SPEED_CM_S            50.0f
-#define MAX_ANGULAR_SPEED_RAD_S          1.0f      /* 最大角速度 (rad/s) */
-#define MAX_WHEEL_ACCEL_CM_S2            100.0f
-#define SEARCH_ROTATION_SPEED_DEG_S      12.0f
-#define TRACKING_LINEAR_SPEED_CM_S       25.0f
+#define MAX_LINEAR_SPEED_CM_S            65.0f
+#define MAX_ANGULAR_SPEED_RAD_S          1.4f      /* 最大角速度 (rad/s) */
+#define MAX_WHEEL_ACCEL_CM_S2            200.0f
+#define SEARCH_ROTATION_SPEED_DEG_S      50.0f
+#define TRACKING_LINEAR_SPEED_CM_S       55.0f
 #define COLLECT_LINEAR_SPEED_CM_S        8.0f
-#define WALL_APPROACH_SPEED_CM_S         15.0f
+#define WALL_APPROACH_SPEED_CM_S         35.0f
 #define MANUAL_LINEAR_SPEED_CM_S         20.0f
-#define MANUAL_ROTATE_SPEED_DEG_S        20.0f
-#define MANUAL_TURN_LINEAR_RATIO         0.55f
+#define MANUAL_ROTATE_SPEED_DEG_S        40.0f
+#define TIGHT_TURN_LINEAR_SPEED_CM_S      8.0f
+#define TIGHT_TURN_ANGULAR_SPEED_DEG_S    65.0f
 
 /* 9. 视觉追踪参数 */
+#define CAMERA_X_AXIS_REVERSED            1U  /* 摄像头倒装，左右图像坐标取反 */
 #define TRACKING_DEADZONE_PX             15
 #define TARGET_DISTANCE_MAX_CM           50U
 #define COLLECT_DISTANCE_CM              10U
 #define BLACK_AREA_ARRIVE_CM             10U
-#define TRACKING_SLOW_RATIO              0.8f
+#define TRACKING_SLOW_RATIO              1.0f
 #define BLACK_AREA_OBJECT_TYPE           3U
 #define TOTAL_OBJECTS_TO_COLLECT         5U
 
@@ -133,13 +143,13 @@ typedef struct {
 #define FUZZY_CENTER_PM                  (80)
 #define FUZZY_CENTER_PB                  (120)
 /* 输出 singleton (rad/s) */
-#define FUZZY_OUT_NB_RAD_S               (-0.5f)   /* 大幅右转 (CW) */
-#define FUZZY_OUT_NM_RAD_S               (-0.3f)
-#define FUZZY_OUT_NS_RAD_S               (-0.15f)
+#define FUZZY_OUT_NB_RAD_S               (-1.0f)   /* 大幅右转 (CW) */
+#define FUZZY_OUT_NM_RAD_S               (-0.65f)
+#define FUZZY_OUT_NS_RAD_S               (-0.35f)
 #define FUZZY_OUT_ZE_RAD_S               (0.0f)
-#define FUZZY_OUT_PS_RAD_S               (0.15f)
-#define FUZZY_OUT_PM_RAD_S               (0.3f)
-#define FUZZY_OUT_PB_RAD_S               (0.5f)    /* 大幅左转 (CCW) */
+#define FUZZY_OUT_PS_RAD_S               (0.35f)
+#define FUZZY_OUT_PM_RAD_S               (0.65f)
+#define FUZZY_OUT_PB_RAD_S               (1.0f)    /* 大幅左转 (CCW) */
 
 /* 11. 车轮与编码器参数 */
 #define WHEEL_DIAMETER_CM                6.5f
@@ -304,14 +314,14 @@ typedef struct {
 #define WHEEL_PID_KP                     2.0f
 #define WHEEL_PID_KI                     8.0f
 #define WHEEL_PID_KD                     0.005f
-#define WHEEL_PID_FEEDFORWARD_DUTY       1200.0f
+#define WHEEL_PID_FEEDFORWARD_DUTY       2000.0f
 #define WHEEL_SPEED_FILTER_ALPHA         0.25f
 #define WHEEL_D_FILTER_ALPHA             0.20f
 #define WHEEL_PID_I_MIN                  (-1000.0f)
 #define WHEEL_PID_I_MAX                  1800.0f
-#define WHEEL_PID_OUTPUT_MAX             3000.0f
+#define WHEEL_PID_OUTPUT_MAX             3400.0f
 #define WHEEL_START_BOOST_MS             800U
-#define WHEEL_START_BOOST_DUTY_PCT       60         /* 占 FR_PWM_MAX 的百分比 */
+#define WHEEL_START_BOOST_DUTY_PCT       75         /* 占 FR_PWM_MAX 的百分比 */
 /* 保护阈值 */
 #define WHEEL_REVERSE_LIMIT_MM_S         50.0f
 #define WHEEL_REVERSE_LIMIT_TICKS        50U
@@ -321,7 +331,10 @@ typedef struct {
 #define WHEEL_NO_FB_LIMIT_TICKS         500U
 
 /* 23. OpenMV 协议常量 (openmv_uart 用)
- *   OpenMV → STM32 帧: "V,detected,x_offset_px,y_offset_px,distance_cm,object_type\n"
+ *   OpenMV → STM32 帧: "V,color,cx,cy,distance_cm\n"
+ *   color: 0=未检测到, 1=红色物块, 2=黄色物块, 3=黑区。
+ *   STM32接收后根据VGA中心(320,240)生成x/y_offset供运动策略使用；
+ *   x_offset会根据CAMERA_X_AXIS_REVERSED决定是否反向。
  *   STM32 → OpenMV 命令: "M,0\n"=物块模式, "M,1\n"=黑色卸货区模式
  *   OpenMV 端 (Python, 运行在摄像头上, STM32 无法动态加载) 参数参考:
  *     FOCAL_LENGTH_PX = 480.0, IMAGE_WIDTH=320, IMAGE_HEIGHT=240

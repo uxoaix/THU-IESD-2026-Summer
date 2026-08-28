@@ -10,11 +10,10 @@
  *            → OpenMvUart_Process (主循环调) → ParseLine → s_latest
  *            → 上层 GetLatest 拿到 VisionData_t
  *
- * 【协议格式】
- *   新版 (推荐): V,detected,x,y,dist,type\n
- *     detected  (0/1), x/y 像素偏移 (-320~320, -240~240), distance cm
- *   旧版 (兼容): $cx,cy,w,h,dist\n
- *     中心坐标 + 宽高 + 距离, 没有类别 → 强制 type=1
+ * 【测试协议】
+ *   V,color,cx,cy,distance_cm\n
+ *   color: 0=无目标, 1=红色, 2=黄色, 3=黑区。
+ *   cx/cy 是VGA原始中心坐标，接收后自动换算相对画面中心的偏移。
  *
  * 【保护机制】
  *   - VISION_STALE_MS = 500ms —— 如果 500ms 没收到新帧, GetLatest 自动把 detected 清 0
@@ -52,70 +51,53 @@ static uint8_t s_detection_mode = 0xFFU;
 
 /* --------------------------------------------------------------------------
  * 【函数】ParseLine
- * 【作用】把一行字符串解析成 VisionData_t, 支持新版和旧版两种协议
+ * 【作用】把测试协议的一行字符串解析成 VisionData_t
  * 【参数】line - 以 '\0' 结尾的一行字符串 (不含 \r\n)
  * 【返回】无; 成功时 s_latest 更新 + s_valid_frames++, 失败 s_invalid_frames++
  * 【校验】所有字段都做范围检查 (比如 distance ≤ 1000cm), 超出就当坏帧
  * ------------------------------------------------------------------------- */
 static void ParseLine(const char *line)
 {
-  unsigned int detected;
-  int x_offset;
-  int y_offset;
+  unsigned int color;
+  unsigned int center_x;
+  unsigned int center_y;
   unsigned int distance;
-  unsigned int object_type;
-  int center_x;
-  int center_y;
-  unsigned int width;
-  unsigned int height;
-
-  if (sscanf(line, "V,%u,%d,%d,%u,%u",
-             &detected,
-             &x_offset,
-             &y_offset,
-             &distance,
-             &object_type) == 5)
-  {
-    if ((detected <= 1U) &&
-        (x_offset >= -320) && (x_offset <= 320) &&
-        (y_offset >= -240) && (y_offset <= 240) &&
-        (distance <= 1000U) &&
-        (object_type <= 255U))
-    {
-      s_latest.detected = (uint8_t)detected;
-      s_latest.x_offset_px = (int16_t)x_offset;
-      s_latest.y_offset_px = (int16_t)y_offset;
-      s_latest.distance_cm = (uint16_t)distance;
-      s_latest.object_type = (uint8_t)object_type;
-      s_latest.timestamp_ms = HAL_GetTick();
-      s_valid_frames++;
-      return;
-    }
-  }
+  char extra;
 
   /*
-   * 兼容工程早期脚本：$cx,cy,w,h,dist
-   * 旧协议没有颜色类别，只能按普通物块(type=1)处理。
+   * 尾部%c用于拒绝字段过多的帧；标准四字段帧只会成功转换4项。
+   * 无目标帧固定为V,0,0,0,0。
    */
-  if (sscanf(line, "$%d,%d,%u,%u,%u",
+  if (sscanf(line, "V,%u,%u,%u,%u%c",
+             &color,
              &center_x,
              &center_y,
-             &width,
-             &height,
-             &distance) == 5)
+             &distance,
+             &extra) == 4)
   {
-    if ((center_x >= 0) && (center_x <= 320) &&
-        (center_y >= 0) && (center_y <= 240) &&
-        (width <= 320U) && (height <= 240U) &&
-        (distance <= 1000U))
+    if ((color <= 255U) &&
+        (center_x < 640U) &&
+        (center_y < 480U) &&
+        (distance <= 1000U) &&
+        ((color != 0U) ||
+         ((center_x == 0U) && (center_y == 0U) && (distance == 0U))))
     {
-      s_latest.detected =
-        ((width > 0U) && (height > 0U)) ? 1U : 0U;
-      s_latest.x_offset_px = (int16_t)(center_x - 160);
-      s_latest.y_offset_px = (int16_t)(center_y - 120);
+      s_latest.detected = (color != 0U) ? 1U : 0U;
+      s_latest.center_x_px = (uint16_t)center_x;
+      s_latest.center_y_px = (uint16_t)center_y;
+      /*
+       * 摄像头倒装时，画面中的左/右与车体控制方向相反。
+       * 保留原始cx用于诊断，只对运动控制使用的x_offset取反。
+       */
+      s_latest.x_offset_px = (color != 0U)
+                           ? (CAMERA_X_AXIS_REVERSED
+                              ? (int16_t)(320 - (int32_t)center_x)
+                              : (int16_t)((int32_t)center_x - 320))
+                           : 0;
+      s_latest.y_offset_px = (color != 0U)
+                           ? (int16_t)((int32_t)center_y - 240) : 0;
       s_latest.distance_cm = (uint16_t)distance;
-      s_latest.object_type =
-        (s_latest.detected != 0U) ? 1U : 0U;
+      s_latest.object_type = (uint8_t)color;
       s_latest.timestamp_ms = HAL_GetTick();
       s_valid_frames++;
       return;
@@ -202,6 +184,8 @@ void OpenMvUart_GetLatest(VisionData_t *vision)
       VISION_STALE_MS)
   {
     vision->detected = 0U;
+    vision->center_x_px = 0U;
+    vision->center_y_px = 0U;
     vision->x_offset_px = 0;
     vision->y_offset_px = 0;
     vision->distance_cm = 0U;

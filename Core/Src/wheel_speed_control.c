@@ -22,9 +22,9 @@
  *      → fault = WHEEL_SPEED_FAULT_NO_FEEDBACK (编码器断了或电机堵转)
  *   3. fault 发生: duty=0, 直到上层 ResetFault
  *
- * 【编码器→电机映射】注意 motor 和 encoder 的 WheelId_t 顺序不同!
- *   ReadEncoderSpeed: WHEEL_FRONT_LEFT → EncoderFr (PE9), WHEEL_FRONT_RIGHT → EncoderPe13 (PE13)
- *   SetMotorDuty:     WHEEL_FRONT_LEFT → MotorFr (PE9), WHEEL_FRONT_RIGHT → MotorPe13 (PE13)
+ * 【实车轮位映射】
+ *   左前=PE13，左后=PE14，右前=PE9，右后=PE11。
+ *   编码器和电机均按该物理轮位绑定到同一个 WheelId_t。
  *   这个映射在函数内部硬编码, 改硬件时只动 switch-case 里的几行。
  *
  * 【参数来源】motion_config.h §22 统一管理, 本文件直接 WHEEL_* 宏引用。
@@ -258,22 +258,21 @@ static int16_t PidUpdate(SpeedController_t *ctrl,
 
 /* --------------------------------------------------------------------------
  * 【函数】ReadEncoderSpeed —— 查表读取指定轮子的编码器速度 (mm/s)
- * 【注意】WheelId_t 和 实际电机/编码器 的映射是硬编码在 switch-case 里的!
- *        WHEEL_FRONT_LEFT → EncoderFr (PE9 前轮右编码器?), WHEEL_FRONT_RIGHT → EncoderPe13
- *        这个映射和下面 SetMotorDuty 对称, 改硬件只动这两个 switch-case
+ * 【注意】WheelId_t 与实车轮位的映射集中在本 switch-case，
+ *        并与下面 SetMotorDuty 保持严格对称。
  * ------------------------------------------------------------------------- */
 static float ReadEncoderSpeed(WheelId_t wheel)
 {
   switch (wheel)
   {
     case WHEEL_FRONT_LEFT:
-      return EncoderFr_GetSpeedMmS();       /* PE9 */
+      return EncoderPe13_GetSpeedMmS();     /* 实车左前：PE13 */
     case WHEEL_FRONT_RIGHT:
-      return EncoderPe13_GetSpeedMmS();     /* PE13 */
+      return EncoderFr_GetSpeedMmS();       /* 实车右前：PE9 */
     case WHEEL_REAR_LEFT:
-      return EncoderFl_GetSpeedMmS();       /* PE11 */
+      return EncoderPe14_GetSpeedMmS();     /* 实车左后：PE14 */
     case WHEEL_REAR_RIGHT:
-      return EncoderPe14_GetSpeedMmS();     /* PE14 */
+      return EncoderFl_GetSpeedMmS();       /* 实车右后：PE11 */
     default:
       return 0.0f;
   }
@@ -290,16 +289,16 @@ static void SetMotorDuty(WheelId_t wheel, int16_t signed_duty)
   switch (wheel)
   {
     case WHEEL_FRONT_LEFT:
-      MotorFr_SetDuty((int16_t)(FR_DRIVE_SIGN * signed_duty));
-      break;
-    case WHEEL_FRONT_RIGHT:
       MotorPe13_SetDuty((int16_t)(PE13_DRIVE_SIGN * signed_duty));
       break;
+    case WHEEL_FRONT_RIGHT:
+      MotorFr_SetDuty((int16_t)(FR_DRIVE_SIGN * signed_duty));
+      break;
     case WHEEL_REAR_LEFT:
-      MotorFl_SetDuty((int16_t)(FL_DRIVE_SIGN * signed_duty));
+      MotorPe14_SetDuty((int16_t)(PE14_DRIVE_SIGN * signed_duty));
       break;
     case WHEEL_REAR_RIGHT:
-      MotorPe14_SetDuty((int16_t)(PE14_DRIVE_SIGN * signed_duty));
+      MotorFl_SetDuty((int16_t)(FL_DRIVE_SIGN * signed_duty));
       break;
     default:
       break;
