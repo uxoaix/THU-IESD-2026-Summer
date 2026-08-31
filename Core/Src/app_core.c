@@ -2,6 +2,7 @@
 #include "actuator_servos.h"
 #include "dbg_uart.h"
 #include "hc05_uart.h"
+#include "home_trajectory.h"
 #include "imu_driver.h"
 #include "imu_processor.h"
 #include "motion_strategy.h"
@@ -13,7 +14,7 @@
 
 #define CONTROL_PERIOD_MS 10U
 #define START_DELAY_MS 1000U
-#define TELEMETRY_PERIOD_MS 200U
+#define TELEMETRY_PERIOD_MS 100U
 
 typedef enum { CONTROL_MANUAL = 0, CONTROL_AUTO = 1 } ControlMode_t;
 static ControlMode_t s_mode;
@@ -130,6 +131,12 @@ static void HandleBluetooth(uint32_t now)
       }
       s_mode = CONTROL_MANUAL;
       (void)ActuatorServos_TriggerCycle(ACTUATOR_SERVO_BRUSH, now); break;
+    case HC05_EVENT_SET_HOME:
+      /* 停在新的卸货点发送SET_HOME；下一次AUTO从此处建立(0,0,0)。 */
+      ActuatorServos_Stop();
+      s_mode = CONTROL_MANUAL;
+      StopAndResetAuto();
+      break;
     case HC05_EVENT_STATUS:
       s_telemetry_tick = 0U; break;
     default: break;
@@ -139,25 +146,46 @@ static void HandleBluetooth(uint32_t now)
 
 static void SendTelemetry(uint32_t now)
 {
-  FusionState_t fusion;
+  float left_cm_s;
+  float right_cm_s;
+  float linear_cm_s;
+  float angular_deg_s;
+
   /* 手动停车模式也刷新视觉快照，便于只测试OpenMV→STM32传输。 */
   OpenMvUart_GetLatest(&s_vision);
-  SensorFusion_GetState(&fusion);
-  DbgUart_Printf("S,%lu,mode=%u,imu=%u,fused=%u,count=%u,state=%u,"
+
+  left_cm_s =
+    (WheelSpeedControl_GetSpeedMmS(WHEEL_FRONT_LEFT) +
+     WheelSpeedControl_GetSpeedMmS(WHEEL_REAR_LEFT)) / 20.0f;
+  right_cm_s =
+    (WheelSpeedControl_GetSpeedMmS(WHEEL_FRONT_RIGHT) +
+     WheelSpeedControl_GetSpeedMmS(WHEEL_REAR_RIGHT)) / 20.0f;
+  linear_cm_s = (left_cm_s + right_cm_s) * 0.5f;
+  angular_deg_s =
+    ((right_cm_s - left_cm_s) / WHEEL_TRACK_WIDTH_CM) *
+    (180.0f / 3.14159265358979f);
+
+  DbgUart_Printf("S,%lu,mode=%u,v_cm_s_x10=%ld,w_deg_s_x10=%ld,count=%u,"
+                 "home_x=%d,home_y=%d,"
+                 "state=%u,state_name=%s,\n"
                  "det=%u,color=%u,cx=%u,cy=%u,xoff=%d,yoff=%d,"
-                 "dist=%u,vision_ok=%lu,vision_bad=%lu,wall=%u\n",
+                 "dist=%u,vision_ok=%lu,vision_bad=%lu\n",
     (unsigned long)now, (unsigned int)s_mode,
-    (unsigned int)fusion.imu_alive, (unsigned int)fusion.fused,
+    (long)DbgUart_Scaled(linear_cm_s, 10.0f),
+    (long)DbgUart_Scaled(angular_deg_s, 10.0f),
     (unsigned int)MotionStrategy_GetCollectedCount(),
-    (unsigned int)MotionStrategy_GetState(), (unsigned int)s_vision.detected,
+    (int)HomeTrajectory_GetXcm(),
+    (int)HomeTrajectory_GetYcm(),
+    (unsigned int)MotionStrategy_GetState(),
+    MotionStrategy_GetStateName(),
+    (unsigned int)s_vision.detected,
     (unsigned int)s_vision.object_type,
     (unsigned int)s_vision.center_x_px,
     (unsigned int)s_vision.center_y_px,
     (int)s_vision.x_offset_px, (int)s_vision.y_offset_px,
     (unsigned int)s_vision.distance_cm,
     (unsigned long)OpenMvUart_GetValidFrameCount(),
-    (unsigned long)OpenMvUart_GetInvalidFrameCount(),
-    (unsigned int)s_wall.distance_cm);
+    (unsigned long)OpenMvUart_GetInvalidFrameCount());
 }
 
 void AppCore_Init(void)

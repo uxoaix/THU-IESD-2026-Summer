@@ -38,7 +38,7 @@ static uint16_t s_tilt_angle = CAMERA_TILT_CENTER_DEG;  /* 当前指令角度 (�
  * @brief  三角隶属函数 (计算输入属于某档的程度)
  *
  * @param  x           输入值 (例如 x_offset_px)
- * @param  center      档位中心 (例如 NB 档中心是 -120)
+ * @param  center      档位中心 (例如 QVGA下 NB 档中心是 -120)
  * @param  half_width  半宽 (距离 center 多少像素内才算"属于"这个档)
  * @return 隶属度 [0, 1], 1=完全属于, 0=完全不属于
  */
@@ -59,26 +59,23 @@ static float TriangularMF(float x, float center, float half_width)
  *
  * 【完整流程】
  *   1. 输入越界保护: 把 x_offset_px 限制在 [-160, +160] 内
- *   2. 死区判断: |x_offset_px| < 15 像素 → 返回 0 (避免抖动)
+ *   2. 死区判断: |alignment_error| ≤ TRACKING_DEADZONE_PX → 返回0
  *   3. 算 7 个档位的隶属度
  *   4. 加权平均: Σ(隶属度 × 对应输出) / Σ隶属度
- *   5. 输出限幅: 限制在 ±1.0 rad/s 内
+ *   5. 输出限幅: 限制在配置的最大角速度内
  *
- * @param   x_offset_px  目标水平偏移 (像素, 负=偏左, 正=偏右)
+ * @param   x_offset_px  已扣除摄像头安装偏移的水平对准误差
  * @return  角速度修正 (rad/s, 正=左转, 负=右转)
  */
 float BlockAlignment_GetAngularCorrection(int16_t x_offset_px)
 {
-    /* 输入越界保护:
-     * FUZZY_X_OFFSET_MAX_PX=160 为 OpenMV 半宽, 超出此范围的输入
-     * 会使所有隶属函数返回 0 (sum_mu=0 触发安全返回), 但提前 clamp
-     * 可使 FUZZY_X_OFFSET_MAX_PX 常量生效, 符合"参数集中且实际使用"原则。 */
+    /* QVGA图像宽320，中心为160，因此水平偏差最大约为±160像素。 */
     if (x_offset_px >  FUZZY_X_OFFSET_MAX_PX) x_offset_px =  FUZZY_X_OFFSET_MAX_PX;
     if (x_offset_px < -FUZZY_X_OFFSET_MAX_PX) x_offset_px = -FUZZY_X_OFFSET_MAX_PX;
 
-    /* 死区内不修正, 避免中心附近方向抖动:
-     * 目标在正中央 ±15 像素内, 视为"已对准", 不再微调, 防止车左右晃。 */
-    if (x_offset_px > -TRACKING_DEADZONE_PX && x_offset_px < TRACKING_DEADZONE_PX) {
+    /* 调用方已扣除TRACKING_CENTER_OFFSET_PX，此处只处理对称误差死区。 */
+    if (x_offset_px >= -TRACKING_DEADZONE_PX &&
+        x_offset_px <=  TRACKING_DEADZONE_PX) {
         return 0.0f;
     }
 
@@ -97,16 +94,21 @@ float BlockAlignment_GetAngularCorrection(int16_t x_offset_px)
     /* 2. 规则表: x 偏左 → ω 正 (左转CCW), x 偏右 → ω 负 (右转CW)
      * 每个档位对应一个固定的输出角速度 (singleton):
      *   NB → PB (偏左极大 → 大幅左转, +1.0 rad/s)
-     *   NM → PM (偏左中等 → 中等左转, +0.65 rad/s)
-     *   NS → PS (偏左稍小 → 稍微左转, +0.35 rad/s)
+     *   NM → PM (偏左中等 → 中等左转, +0.7 rad/s)
+     *   NS → PS (偏左稍小 → 稍微左转, +0.4 rad/s)
      *   ZE → ZE (正中     → 不转,     0 rad/s)
-     *   PS → NS (偏右稍小 → 稍微右转, -0.35 rad/s)
-     *   PM → NM (偏右中等 → 中等右转, -0.65 rad/s)
+     *   PS → NS (偏右稍小 → 稍微右转, -0.4 rad/s)
+     *   PM → NM (偏右中等 → 中等右转, -0.7 rad/s)
      *   PB → NB (偏右极大 → 大幅右转, -1.0 rad/s) */
     const float sum_mu = mu_NB + mu_NM + mu_NS + mu_ZE + mu_PS + mu_PM + mu_PB;
-    /* 除零保护: 所有隶属度都为 0 (输入完全在边界外) → 安全返回 0 */
+    /*
+     * 极限边缘x=±320刚好位于最外侧三角形的零点。
+     * 此时不能返回0，否则目标越靠边车辆反而不转；直接给最大修正。
+     */
     if (sum_mu < 1e-6f) {
-        return 0.0f;
+        return (x_offset_px < 0)
+             ? FUZZY_OUT_PB_RAD_S
+             : FUZZY_OUT_NB_RAD_S;
     }
 
     /* 加权求和: 每个档位的"力度" × 对应输出, 累加得分母分子 */

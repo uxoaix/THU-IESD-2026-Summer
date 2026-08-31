@@ -13,7 +13,7 @@
  * 【测试协议】
  *   V,color,cx,cy,distance_cm\n
  *   color: 0=无目标, 1=红色, 2=黄色, 3=黑区。
- *   cx/cy 是VGA原始中心坐标，接收后自动换算相对画面中心的偏移。
+ *   cx/cy 是QVGA原始中心坐标，接收后自动换算相对画面中心的偏移。
  *
  * 【保护机制】
  *   - VISION_STALE_MS = 500ms —— 如果 500ms 没收到新帧, GetLatest 自动把 detected 清 0
@@ -76,8 +76,8 @@ static void ParseLine(const char *line)
              &extra) == 4)
   {
     if ((color <= 255U) &&
-        (center_x < 640U) &&
-        (center_y < 480U) &&
+        (center_x < VISION_IMAGE_WIDTH_PX) &&
+        (center_y < VISION_IMAGE_HEIGHT_PX) &&
         (distance <= 1000U) &&
         ((color != 0U) ||
          ((center_x == 0U) && (center_y == 0U) && (distance == 0U))))
@@ -91,11 +91,14 @@ static void ParseLine(const char *line)
        */
       s_latest.x_offset_px = (color != 0U)
                            ? (CAMERA_X_AXIS_REVERSED
-                              ? (int16_t)(320 - (int32_t)center_x)
-                              : (int16_t)((int32_t)center_x - 320))
+                              ? (int16_t)((int32_t)VISION_CENTER_X_PX -
+                                          (int32_t)center_x)
+                              : (int16_t)((int32_t)center_x -
+                                          (int32_t)VISION_CENTER_X_PX))
                            : 0;
       s_latest.y_offset_px = (color != 0U)
-                           ? (int16_t)((int32_t)center_y - 240) : 0;
+                           ? (int16_t)((int32_t)center_y -
+                                       (int32_t)VISION_CENTER_Y_PX) : 0;
       s_latest.distance_cm = (uint16_t)distance;
       s_latest.object_type = (uint8_t)color;
       s_latest.timestamp_ms = HAL_GetTick();

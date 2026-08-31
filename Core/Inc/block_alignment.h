@@ -3,7 +3,7 @@
  * @brief   物块对准模块 (水平模糊控制 + 垂直俯仰跟踪)
  *
  * 【两部分功能】
- *   ① 水平对准 (x_offset_px → 车体角速度修正): 7 档模糊控制, 让车转向把物块拉到视野水平中央
+ *   ① 水平对准 (alignment_error → 车体角速度修正): 7档模糊控制
  *   ② 垂直跟踪 (y_offset_px → 摄像头俯仰角): 比例控制 + 死区 + 限速, 让摄像头俯仰把物块拉到视野垂直中央
  *
  * 【7 个档位 (模糊集) — 水平用】
@@ -12,7 +12,7 @@
  *   PS (稍偏右)  PM (中等偏右)  PB (极大偏右)
  *
  * 【输入输出】
- *   水平: 输入 x_offset_px (像素, [-160, +160], 负=左, 正=右) → 输出角速度修正 (rad/s)
+ *   水平: 输入扣除安装偏移后的误差 (像素, [-160, +160]) → 输出角速度修正
  *   垂直: 输入 y_offset_px (像素, 负=上, 正=下) → 控制俯仰舵机角度
  */
 #ifndef BLOCK_ALIGNMENT_H
@@ -42,7 +42,7 @@ void Servo_Camera_Tilt(uint16_t angle_deg);
  * 【作用】
  *   输入摄像头看到的"目标偏左偏右多少像素", 输出"应该转多快的角速度"。
  *
- * @param   x_offset_px  目标水平偏移 (像素)
+ * @param   x_offset_px  已扣除TRACKING_CENTER_OFFSET_PX的对准误差
  *                    - 负数 = 目标偏左 → 返回正数 (左转把目标拉回中央)
  *                    - 正数 = 目标偏右 → 返回负数 (右转把目标拉回中央)
  *                    - 0    = 目标居中 → 返回 0 (不转)
@@ -52,7 +52,7 @@ void Servo_Camera_Tilt(uint16_t angle_deg);
  *   motion_strategy 的 PRE_CENTERING 和 TARGET_TRACKING 状态调用本函数,
  *   把返回值传给 Motion_Rotate() 让车原地微调或边走边修正。
  *
- * @note    死区内 (|x_offset_px| < 15 像素) 返回 0, 避免中心附近方向抖动。
+ * @note    死区内 (|x_offset_px| <= TRACKING_DEADZONE_PX) 返回0。
  *          输出限幅在 ±1.0 rad/s (MAX_ANGULAR_SPEED_RAD_S)。
  */
 float BlockAlignment_GetAngularCorrection(int16_t x_offset_px);

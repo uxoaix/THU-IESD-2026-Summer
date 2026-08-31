@@ -16,6 +16,7 @@ void Motion_Drive(float linear_speed, float angular_speed,
 void Motion_StopOutput(MotionCommand_t *out);
 void MotionStrategy_Stop(void);
 MotionState_t MotionStrategy_GetState(void);
+const char *MotionStrategy_GetStateName(void);
 uint8_t MotionStrategy_GetCollectedCount(void);
 uint8_t MotionStrategy_IsReverseHead(void);
 

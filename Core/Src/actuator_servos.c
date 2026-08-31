@@ -2,8 +2,8 @@
 #include "tim.h"
 
 /*
- * 舵机参数 (SERVO_MIN/MAX_PULSE_US / SERVO_ANGLE_LIMIT_DEG / DOOR_* / CAMERA_* /
- * BUCKET_* / BRUSH_* 的 START/END_DEG 与 OUTBOUND/RETURN_MS) 已集中到
+ * 三路SG90和滚刷MG995分别使用独立脉宽参数；各执行器的START/END_DEG与
+ * OUTBOUND/RETURN_MS已集中到
  * motion_config.h §21, 本文件不再重复定义, 避免"改了一处忘了另一处"。
  * actuator_servos.h 已 #include motion_config.h, 故本文件可直接使用这些宏。
  */
@@ -20,6 +20,9 @@ typedef struct {
   uint16_t end_deg;
   uint16_t outbound_ms;
   uint16_t return_ms;
+  uint16_t min_pulse_us;
+  uint16_t max_pulse_us;
+  uint16_t angle_limit_deg;
   uint32_t state_tick;
   ServoCycleState_t state;
 } ServoCycle_t;
@@ -27,39 +30,48 @@ typedef struct {
 static ServoCycle_t s_servo[ACTUATOR_SERVO_COUNT] = {
   {
     TIM_CHANNEL_1, DOOR_START_DEG, DOOR_END_DEG,
-    DOOR_OUTBOUND_MS, DOOR_RETURN_MS, 0U, SERVO_CYCLE_IDLE
+    DOOR_OUTBOUND_MS, DOOR_RETURN_MS,
+    SG90_MIN_PULSE_US, SG90_MAX_PULSE_US, SG90_ANGLE_LIMIT_DEG,
+    0U, SERVO_CYCLE_IDLE
   },
   {
     TIM_CHANNEL_2, CAMERA_START_DEG, CAMERA_END_DEG,
-    CAMERA_OUTBOUND_MS, CAMERA_RETURN_MS, 0U, SERVO_CYCLE_IDLE
+    CAMERA_OUTBOUND_MS, CAMERA_RETURN_MS,
+    SG90_MIN_PULSE_US, SG90_MAX_PULSE_US, SG90_ANGLE_LIMIT_DEG,
+    0U, SERVO_CYCLE_IDLE
   },
   {
     TIM_CHANNEL_3, BUCKET_START_DEG, BUCKET_END_DEG,
-    BUCKET_OUTBOUND_MS, BUCKET_RETURN_MS, 0U, SERVO_CYCLE_IDLE
+    BUCKET_OUTBOUND_MS, BUCKET_RETURN_MS,
+    SG90_MIN_PULSE_US, SG90_MAX_PULSE_US, SG90_ANGLE_LIMIT_DEG,
+    0U, SERVO_CYCLE_IDLE
   },
   {
     TIM_CHANNEL_4, BRUSH_START_DEG, BRUSH_END_DEG,
-    BRUSH_OUTBOUND_MS, BRUSH_RETURN_MS, 0U, SERVO_CYCLE_IDLE
+    BRUSH_OUTBOUND_MS, BRUSH_RETURN_MS,
+    MG995_MIN_PULSE_US, MG995_MAX_PULSE_US, MG995_ANGLE_LIMIT_DEG,
+    0U, SERVO_CYCLE_IDLE
   }
 };
 
-static uint16_t AngleToPulse(uint16_t angle_deg)
+static uint16_t AngleToPulse(const ServoCycle_t *servo,
+                             uint16_t angle_deg)
 {
-  if (angle_deg > SERVO_ANGLE_LIMIT_DEG)
+  if (angle_deg > servo->angle_limit_deg)
   {
-    angle_deg = SERVO_ANGLE_LIMIT_DEG;
+    angle_deg = servo->angle_limit_deg;
   }
 
-  return (uint16_t)(SERVO_MIN_PULSE_US +
-    ((uint32_t)(SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) *
-     angle_deg / SERVO_ANGLE_LIMIT_DEG));
+  return (uint16_t)(servo->min_pulse_us +
+    ((uint32_t)(servo->max_pulse_us - servo->min_pulse_us) *
+     angle_deg / servo->angle_limit_deg));
 }
 
 static void SetAngleRaw(const ServoCycle_t *servo, uint16_t angle_deg)
 {
   __HAL_TIM_SET_COMPARE(&htim3,
                         servo->channel,
-                        AngleToPulse(angle_deg));
+                        AngleToPulse(servo, angle_deg));
 }
 
 void ActuatorServos_Init(void)

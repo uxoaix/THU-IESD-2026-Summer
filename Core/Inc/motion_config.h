@@ -28,14 +28,19 @@ typedef enum {
   WHEEL_COUNT
 } WheelId_t;
 
-/* 2. 运动状态机定义 (16 态) */
+/* 2. 运动状态机定义 (21 态) */
 typedef enum {
   MOTION_STATE_INIT = 0,
   MOTION_STATE_ROTATE_SEARCH,
   MOTION_STATE_PRE_CENTERING,
   MOTION_STATE_TARGET_TRACKING,
+  MOTION_STATE_FINAL_APPROACH,
   MOTION_STATE_BRUSH_COLLECT,
   MOTION_STATE_SEARCH_CONTINUE,
+  MOTION_STATE_HOME_PREPARE,
+  MOTION_STATE_HOME_FOLLOW,
+  MOTION_STATE_HOME_TURN_AROUND,
+  MOTION_STATE_HOME_DONE,
   MOTION_STATE_WALL_SCAN_FIRST,
   MOTION_STATE_WALL_SCAN_SECOND,
   MOTION_STATE_WALL_TURN_OPPOSITE,
@@ -54,8 +59,8 @@ typedef enum {
 #endif
 
 /*
- * 前阶段联调：1=仅循环执行搜索物块→对准→接近→滚刷→继续搜索。
- * 不进入墙扫、后斗、摄像头反转、黑区搜索和卸货流程。
+ * 前阶段联调：1=循环执行搜索→对准→收集，满10次后直线返航并卸货。
+ * 不进入墙扫、摄像头反转和黑区搜索流程。
  */
 #define OBJECT_APPROACH_TEST_MODE         1U
 
@@ -63,8 +68,8 @@ typedef enum {
  *   字段单位在两端保持一致; timestamp_ms 由 STM32 接收时打戳。 */
 typedef struct {
   uint8_t  detected;        /* 1=看到目标, 0=没看到 */
-  uint16_t center_x_px;     /* OpenMV 原始中心坐标, VGA范围 0~639 */
-  uint16_t center_y_px;     /* OpenMV 原始中心坐标, VGA范围 0~479 */
+  uint16_t center_x_px;     /* OpenMV 原始中心坐标, QVGA范围 0~319 */
+  uint16_t center_y_px;     /* OpenMV 原始中心坐标, QVGA范围 0~239 */
   int16_t  x_offset_px;     /* 目标水平偏移 (像素, 负=左, 正=右, 0=居中) */
   int16_t  y_offset_px;     /* 目标垂直偏移 (像素, 负=上, 正=下) */
   uint16_t distance_cm;     /* 目标距离 (cm) */
@@ -103,33 +108,58 @@ typedef struct {
 #define BLACK_SEARCH_TIMEOUT_MS          10000U
 #define TARGET_LOCK_WINDOW_MS            800U
 #define PRE_CENTERING_TIMEOUT_MS         2000U
+#define TRACKING_COMPLETE_MIN_FORWARD_MS 200U /* 至少前进一段时间后才允许判定追踪完成 */
+#define TRACKING_COMPLETE_LOSS_MS        100U /* 目标消失确认后触发滚刷 */
 
 /* 8. 速度与运动控制参数 */
-#define MAX_LINEAR_SPEED_CM_S            65.0f
-#define MAX_ANGULAR_SPEED_RAD_S          1.4f      /* 最大角速度 (rad/s) */
-#define MAX_WHEEL_ACCEL_CM_S2            200.0f
-#define SEARCH_ROTATION_SPEED_DEG_S      50.0f
-#define TRACKING_LINEAR_SPEED_CM_S       55.0f
+#define MAX_LINEAR_SPEED_CM_S            50.0f
+#define MAX_ANGULAR_SPEED_RAD_S          1.0f      /* 最大角速度 (rad/s) */
+#define MAX_WHEEL_ACCEL_CM_S2            120.0f
+#define SEARCH_ROTATION_SPEED_DEG_S      30.0f
+#define TRACKING_LINEAR_SPEED_CM_S       20.0f
 #define COLLECT_LINEAR_SPEED_CM_S        8.0f
-#define WALL_APPROACH_SPEED_CM_S         35.0f
+#define WALL_APPROACH_SPEED_CM_S         25.0f
 #define MANUAL_LINEAR_SPEED_CM_S         20.0f
 #define MANUAL_ROTATE_SPEED_DEG_S        40.0f
 #define TIGHT_TURN_LINEAR_SPEED_CM_S      8.0f
 #define TIGHT_TURN_ANGULAR_SPEED_DEG_S    65.0f
 
 /* 9. 视觉追踪参数 */
+#define VISION_IMAGE_WIDTH_PX            320U   /* OpenMV QVGA 画面宽 */
+#define VISION_IMAGE_HEIGHT_PX           240U   /* OpenMV QVGA 画面高 */
+#define VISION_CENTER_X_PX               (VISION_IMAGE_WIDTH_PX / 2U)
+#define VISION_CENTER_Y_PX               (VISION_IMAGE_HEIGHT_PX / 2U)
 #define CAMERA_X_AXIS_REVERSED            1U  /* 摄像头倒装，左右图像坐标取反 */
-#define TRACKING_DEADZONE_PX             15
+#define TRACKING_DEADZONE_PX             8
+#define TRACKING_CENTER_OFFSET_PX       (-40) /* 摄像头安装偏移，随QVGA分辨率减半 */
 #define TARGET_DISTANCE_MAX_CM           50U
 #define COLLECT_DISTANCE_CM              10U
+#define FINAL_APPROACH_DURATION_MS       1300U /* 追踪结束后保持追踪速度前进1.3秒 */
 #define BLACK_AREA_ARRIVE_CM             10U
 #define TRACKING_SLOW_RATIO              1.0f
+#define TRACKING_CORRECTION_GAIN         1.0f  /* 行进修正不过度放大，尽量保持两侧前进 */
+#define TRACKING_MIN_LINEAR_RATIO        0.60f /* 大偏差时仍保留60%前进速度 */
 #define BLACK_AREA_OBJECT_TYPE           3U
-#define TOTAL_OBJECTS_TO_COLLECT         5U
+#define TOTAL_OBJECTS_TO_COLLECT         2U
 
-/* 10. 模糊控制参数 (block_alignment 子模块, 物块对准)
+/* 返航：编码器距离+IMU融合航向计算二维位置，直接直线驶向原点。
+ * 直线段只走全程的一部分，随后交给OpenMV搜索黑色卸货区，
+ * 用视觉消除里程计累计误差。 */
+#define HOME_ORIGIN_WAIT_MS              1500U
+#define HOME_PARTIAL_RETURN_RATIO        0.2f   /* 直线段只走全程的1/5 */
+#define HOME_FOLLOW_TIMEOUT_MS           20000U /* 直线段兜底超时 */
+#define HOME_ARRIVAL_RADIUS_CM           12.0f
+#define HOME_RETURN_SPEED_CM_S           20.0f
+#define HOME_RETURN_HEADING_KP           1.2f
+#define HOME_RETURN_MAX_ANGULAR_RAD_S    0.8f
+#define HOME_ROTATE_IN_PLACE_DEG         40.0f
+#define HOME_TURN_AROUND_SPEED_DEG_S     45.0f
+#define HOME_TURN_AROUND_TOL_DEG         5.0f
+#define HOME_TURN_AROUND_TIMEOUT_MS      7000U
+
+/* 10. 模糊控制参数 (block_alignment 子模块, 物块对准)-
  *
- *   输入: x_offset_px ([-160, +160], 负=左, 正=右)
+ *   输入: x_offset_px ([-160, +159], QVGA画面，负=左, 正=右)
  *   输出: 角速度修正 (rad/s, 正=逆时针/左转, 负=顺时针/右转)
  *   规则: x偏左→ω正(左转CCW), x偏右→ω负(右转CW), x=0→ω=0 */
 #define FUZZY_X_OFFSET_MAX_PX            160
@@ -144,11 +174,11 @@ typedef struct {
 #define FUZZY_CENTER_PB                  (120)
 /* 输出 singleton (rad/s) */
 #define FUZZY_OUT_NB_RAD_S               (-1.0f)   /* 大幅右转 (CW) */
-#define FUZZY_OUT_NM_RAD_S               (-0.65f)
-#define FUZZY_OUT_NS_RAD_S               (-0.35f)
+#define FUZZY_OUT_NM_RAD_S               (-0.7f)
+#define FUZZY_OUT_NS_RAD_S               (-0.4f)
 #define FUZZY_OUT_ZE_RAD_S               (0.0f)
-#define FUZZY_OUT_PS_RAD_S               (0.35f)
-#define FUZZY_OUT_PM_RAD_S               (0.65f)
+#define FUZZY_OUT_PS_RAD_S               (0.4f)
+#define FUZZY_OUT_PM_RAD_S               (0.7f)
 #define FUZZY_OUT_PB_RAD_S               (1.0f)    /* 大幅左转 (CCW) */
 
 /* 11. 车轮与编码器参数 */
@@ -285,9 +315,14 @@ typedef struct {
  *   四路舵机固定执行 start_deg → end_deg → start_deg 往复; 上层只触发一次。
  *   舵机引脚: DOOR=PA6/TIM3_CH1, CAMERA=PA7/TIM3_CH2,
  *             BUCKET=PB0/TIM3_CH3, BRUSH=PB1/TIM3_CH4。 */
-#define SERVO_MIN_PULSE_US               500U
-#define SERVO_MAX_PULSE_US               2500U
-#define SERVO_ANGLE_LIMIT_DEG            180U
+/* 三个SG90：保持已经实测可用的参数不变。 */
+#define SG90_MIN_PULSE_US                500U
+#define SG90_MAX_PULSE_US                2500U
+#define SG90_ANGLE_LIMIT_DEG             180U
+/* 滚刷MG995：保留机械限位余量，避免上电在端点持续堵转。 */
+#define MG995_MIN_PULSE_US               600U
+#define MG995_MAX_PULSE_US               2400U
+#define MG995_ANGLE_LIMIT_DEG             180U
 
 #define DOOR_START_DEG                   0U
 #define DOOR_END_DEG                     180U
@@ -300,7 +335,7 @@ typedef struct {
 #define CAMERA_RETURN_MS                 1000U
 
 #define BUCKET_START_DEG                 0U
-#define BUCKET_END_DEG                   180U
+#define BUCKET_END_DEG                   100U
 #define BUCKET_OUTBOUND_MS               1000U
 #define BUCKET_RETURN_MS                 1000U
 
@@ -320,8 +355,8 @@ typedef struct {
 #define WHEEL_PID_I_MIN                  (-1000.0f)
 #define WHEEL_PID_I_MAX                  1800.0f
 #define WHEEL_PID_OUTPUT_MAX             3400.0f
-#define WHEEL_START_BOOST_MS             800U
-#define WHEEL_START_BOOST_DUTY_PCT       75         /* 占 FR_PWM_MAX 的百分比 */
+#define WHEEL_START_BOOST_MS             120U
+#define WHEEL_START_BOOST_DUTY_PCT       45         /* 低强度短助推，随后进入差速PID */
 /* 保护阈值 */
 #define WHEEL_REVERSE_LIMIT_MM_S         50.0f
 #define WHEEL_REVERSE_LIMIT_TICKS        50U
@@ -333,11 +368,11 @@ typedef struct {
 /* 23. OpenMV 协议常量 (openmv_uart 用)
  *   OpenMV → STM32 帧: "V,color,cx,cy,distance_cm\n"
  *   color: 0=未检测到, 1=红色物块, 2=黄色物块, 3=黑区。
- *   STM32接收后根据VGA中心(320,240)生成x/y_offset供运动策略使用；
+ *   STM32接收后根据QVGA中心(160,120)生成x/y_offset供运动策略使用；
  *   x_offset会根据CAMERA_X_AXIS_REVERSED决定是否反向。
  *   STM32 → OpenMV 命令: "M,0\n"=物块模式, "M,1\n"=黑色卸货区模式
  *   OpenMV 端 (Python, 运行在摄像头上, STM32 无法动态加载) 参数参考:
- *     FOCAL_LENGTH_PX = 480.0, IMAGE_WIDTH=320, IMAGE_HEIGHT=240
+ *     FOCAL_LENGTH_PX = 185.0, IMAGE_WIDTH=320, IMAGE_HEIGHT=240
  *     BLOCK_THRESHOLD = (81,99,-28,-7,-33,93) [LAB, 需现场重新标定]
  *     BLACK_THRESHOLD  = (0,35,-20,20,-20,20)
  *     BLOCK_WIDTH_CM=8.0, BLACK_AREA_WIDTH_CM=20.0

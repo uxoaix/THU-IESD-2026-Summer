@@ -424,14 +424,27 @@ void WheelSpeedControl_Run(float dt_s, uint8_t enabled)
 
     if (ctrl->run_state == SPEED_RUN_BOOST)
     {
-      ctrl->duty_magnitude = START_BOOST_DUTY;
-      ctrl->boost_elapsed_ms =
-        (uint16_t)(ctrl->boost_elapsed_ms + elapsed_ms);
-      if (ctrl->boost_elapsed_ms >= WHEEL_START_BOOST_MS)
+      if (WHEEL_START_BOOST_MS == 0U)
       {
         ctrl->run_state = SPEED_RUN_PID;
         ctrl->previous_speed = ctrl->speed_filtered;
         ctrl->integral = 0.0f;
+        ctrl->duty_magnitude = PidUpdate(
+          ctrl,
+          AbsFloat(ctrl->target_mm_s),
+          dt_s);
+      }
+      else
+      {
+        ctrl->duty_magnitude = START_BOOST_DUTY;
+        ctrl->boost_elapsed_ms =
+          (uint16_t)(ctrl->boost_elapsed_ms + elapsed_ms);
+        if (ctrl->boost_elapsed_ms >= WHEEL_START_BOOST_MS)
+        {
+          ctrl->run_state = SPEED_RUN_PID;
+          ctrl->previous_speed = ctrl->speed_filtered;
+          ctrl->integral = 0.0f;
+        }
       }
     }
     else
