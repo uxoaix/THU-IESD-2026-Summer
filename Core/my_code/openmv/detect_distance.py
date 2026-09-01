@@ -2,6 +2,7 @@
 # Frame: V,color,cx,cy,distance_cm\n
 # color: 0=none, 1=red, 2=yellow, 3=black unload area.
 # STM32 command: M,0\n=block mode, M,1\n=black unload area mode.
+# Wall frame: W,state,distance_cm\n; state: 0=clear, 1=too close.
 
 import sensor
 import time
@@ -48,11 +49,15 @@ def send_target(color, cx, cy, distance_cm):
     ))
 
 
+def send_wall(wall_state, distance_cm):
+    uart.write("W,%d,%d\n" % (wall_state, distance_cm))
+
+
 def largest_blob(candidates):
     """Return (blob, color config) having the largest pixel count."""
     target = None
     for candidate in candidates:
-        if target is None or candidate[0].pixels() > target[0].pixels():
+        if target is None or candidate[0].pixels > target[0].pixels:
             target = candidate
     return target
 
@@ -83,12 +88,23 @@ color_configs = (
 )
 
 # Black unload area. Threshold must be re-tuned on the real field.
-BLACK_CONFIG = (BLACK_TYPE, "BLACK", (0, 35, -20, 20, -20, 20), (0, 0, 255), 400.0)
+BLACK_CONFIG = (BLACK_TYPE, "BLACK", (0, 29, -15, 18, -21, -1), (0, 0, 255), 400.0)
 # The area is a large floor region, so it needs a bigger blob and merging.
 BLACK_PIXELS_THRESHOLD = 300
 # Reported distance per pixel of gap below the area's near edge.
 # Increase it if the car stops too early, decrease it if it overshoots.
 BLACK_NEAR_EDGE_CM_PER_PX = 0.3
+
+# Always-enabled blue wall collision region. Its distance is estimated from
+# the blue wall's apparent width using a measured real width.
+WALL_ROI = (0, 80, 320, 240)
+BLUE_WALL_THRESHOLD = (21, 61, -97, 65, -85, -33)
+BLUE_WALL_COLOR = (0, 120, 255)
+BLUE_WALL_KNOWN_WIDTH_MM = 500.0
+WALL_MIN_WIDTH_PX = 30
+WALL_MIN_HEIGHT_PX = 20
+WALL_PIXELS_THRESHOLD = 200
+WALL_STOP_DISTANCE_MM = 180.0
 
 # Smaller values make detection more sensitive, but may also detect noise.
 # QVGA blob area is a quarter of the VGA area for the same object.
@@ -114,8 +130,41 @@ while True:
     img = sensor.snapshot()
     candidates = []
 
+    # This collision check always runs, regardless of the STM32-selected mode.
+    wall_blob = None
+    for blob in img.find_blobs(
+        [BLUE_WALL_THRESHOLD],
+        roi=WALL_ROI,
+        pixels_threshold=WALL_PIXELS_THRESHOLD,
+        area_threshold=WALL_PIXELS_THRESHOLD,
+        merge=True,
+    ):
+        if blob.w < WALL_MIN_WIDTH_PX or blob.h < WALL_MIN_HEIGHT_PX:
+            continue
+        if wall_blob is None or blob.pixels > wall_blob.pixels:
+            wall_blob = blob
+
+    if wall_blob is None:
+        send_wall(0, 0)
+    else:
+        wall_distance_mm = (
+            FOCAL_LENGTH_PX * BLUE_WALL_KNOWN_WIDTH_MM
+        ) / wall_blob.w
+        wall_distance_cm = int(wall_distance_mm / 10.0)
+        wall_state = 1 if wall_distance_mm <= WALL_STOP_DISTANCE_MM else 0
+
+        img.draw_rectangle(wall_blob.rect, color=BLUE_WALL_COLOR, thickness=2)
+        img.draw_string(
+            (wall_blob.x, max(wall_blob.y - 12, 0)),
+            "WALL %.1fmm" % wall_distance_mm,
+            color=BLUE_WALL_COLOR,
+            scale=1,
+        )
+        send_wall(wall_state, wall_distance_cm)
+
 
     if detection_mode != 0:
+        green_led.off()
         blue_led.on()
         # Unload area: one large merged region, no cube shape filtering.
         object_type, color_name, threshold, box_color, known_width_mm = BLACK_CONFIG
@@ -134,6 +183,7 @@ while True:
                 known_width_mm,
             ))
     else:
+        blue_led.off()
         green_led.on()
         # Detect each color separately, then select one global largest valid blob.
         for object_type, color_name, threshold, box_color, known_width_mm in color_configs:
@@ -146,8 +196,8 @@ while True:
             )
 
             for blob in blobs:
-                w = blob.w()
-                h = blob.h()
+                w = blob.w
+                h = blob.h
 
                 if w < MIN_BLOB_WIDTH or h < MIN_BLOB_HEIGHT:
                     continue
@@ -171,12 +221,12 @@ while True:
         continue
 
     blob, object_type, color_name, box_color, known_width_mm = target
-    x = blob.x()
-    y = blob.y()
-    w = blob.w()
-    h = blob.h()
-    cx = blob.cx()
-    cy = blob.cy()
+    x = blob.x
+    y = blob.y
+    w = blob.w
+    h = blob.h
+    cx = blob.cx
+    cy = blob.cy
 
     if object_type == BLACK_TYPE:
         # A floor region fills the frame when close, so its width saturates.
@@ -191,7 +241,7 @@ while True:
         distance_mm = (FOCAL_LENGTH_PX * known_width_mm) / w
         distance_cm = int(distance_mm / 10.0)
 
-    img.draw_rectangle(blob.rect(), color=box_color, thickness=2)
+    img.draw_rectangle(blob.rect, color=box_color, thickness=2)
     img.draw_cross((cx, cy), color=box_color, size=5, thickness=2)
     label_y = max(y - 12, 0)
     label = "%s %.1fmm" % (color_name, distance_mm)
