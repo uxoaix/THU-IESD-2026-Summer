@@ -2,7 +2,8 @@
 # Frame: V,color,cx,cy,distance_cm\n
 # color: 0=none, 1=red, 2=yellow, 3=black unload area.
 # STM32 command: M,0\n=block mode, M,1\n=black unload area mode.
-# Wall frame: W,state,distance_cm\n; state: 0=clear, 1=too close.
+# Wall frame: W,state,fill_pct\n; state: 0=clear, 1=too close.
+# fill_pct is the blue share of the wall ROI in percent, for tuning only.
 
 import sensor
 import time
@@ -21,6 +22,10 @@ BLACK_TYPE = 3
 
 # 0 = search red/yellow blocks, 1 = search the black unload area.
 detection_mode = 0
+
+# Latched wall flag. Kept across frames so the enter/exit thresholds
+# can act as hysteresis instead of both being compared every frame.
+wall_state = 0
 
 
 def read_stm32_mode():
@@ -49,8 +54,8 @@ def send_target(color, cx, cy, distance_cm):
     ))
 
 
-def send_wall(wall_state, distance_cm):
-    uart.write("W,%d,%d\n" % (wall_state, distance_cm))
+def send_wall(wall_state, fill_pct):
+    uart.write("W,%d,%d\n" % (wall_state, fill_pct))
 
 
 def largest_blob(candidates):
@@ -97,14 +102,22 @@ BLACK_NEAR_EDGE_CM_PER_PX = 0.3
 
 # Always-enabled blue wall collision region. Its distance is estimated from
 # the blue wall's apparent width using a measured real width.
-WALL_ROI = (0, 80, 320, 240)
+WALL_ROI = (0, 80, IMAGE_WIDTH, IMAGE_HEIGHT - 80)
+WALL_ROI_AREA_PX = WALL_ROI[2] * WALL_ROI[3]
 BLUE_WALL_THRESHOLD = (21, 61, -97, 65, -85, -33)
 BLUE_WALL_COLOR = (0, 120, 255)
-BLUE_WALL_KNOWN_WIDTH_MM = 500.0
 WALL_MIN_WIDTH_PX = 30
 WALL_MIN_HEIGHT_PX = 20
 WALL_PIXELS_THRESHOLD = 200
-WALL_STOP_DISTANCE_MM = 180.0
+
+# The wall is judged by how much of the ROI is blue, not by an estimated
+# distance: a wall wider than the frame saturates any width-based distance,
+# but its pixel share keeps growing all the way in.
+# Two thresholds give hysteresis, so the flag does not chatter at the edge.
+# Calibrate by parking the car where it should back off and reading the
+# reported percentage from the STM32 telemetry field vwall_pct.
+WALL_FILL_ENTER_PCT = 30
+WALL_FILL_EXIT_PCT = 20
 
 # Smaller values make detection more sensitive, but may also detect noise.
 # QVGA blob area is a quarter of the VGA area for the same object.
@@ -131,6 +144,10 @@ while True:
     candidates = []
 
     # This collision check always runs, regardless of the STM32-selected mode.
+    # Sum every blue region that passes the noise filter: the wall can be split
+    # into several blobs by a block standing in front of it or by uneven light,
+    # and what matters is the total blue share of the view, not one blob.
+    wall_pixels = 0
     wall_blob = None
     for blob in img.find_blobs(
         [BLUE_WALL_THRESHOLD],
@@ -141,26 +158,26 @@ while True:
     ):
         if blob.w < WALL_MIN_WIDTH_PX or blob.h < WALL_MIN_HEIGHT_PX:
             continue
+        wall_pixels += blob.pixels
         if wall_blob is None or blob.pixels > wall_blob.pixels:
             wall_blob = blob
 
-    if wall_blob is None:
-        send_wall(0, 0)
-    else:
-        wall_distance_mm = (
-            FOCAL_LENGTH_PX * BLUE_WALL_KNOWN_WIDTH_MM
-        ) / wall_blob.w
-        wall_distance_cm = int(wall_distance_mm / 10.0)
-        wall_state = 1 if wall_distance_mm <= WALL_STOP_DISTANCE_MM else 0
+    # Clamped because the STM32 rejects the frame as malformed above 100.
+    wall_fill_pct = min(100, int(100 * wall_pixels / WALL_ROI_AREA_PX))
+    if wall_fill_pct >= WALL_FILL_ENTER_PCT:
+        wall_state = 1
+    elif wall_fill_pct <= WALL_FILL_EXIT_PCT:
+        wall_state = 0
 
+    if wall_blob is not None:
         img.draw_rectangle(wall_blob.rect, color=BLUE_WALL_COLOR, thickness=2)
         img.draw_string(
             (wall_blob.x, max(wall_blob.y - 12, 0)),
-            "WALL %.1fmm" % wall_distance_mm,
+            "WALL %d%% %d" % (wall_fill_pct, wall_state),
             color=BLUE_WALL_COLOR,
             scale=1,
         )
-        send_wall(wall_state, wall_distance_cm)
+    send_wall(wall_state, wall_fill_pct)
 
 
     if detection_mode != 0:
