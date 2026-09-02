@@ -4,6 +4,7 @@
 # STM32 command: M,0\n=block mode, M,1\n=black unload area mode.
 # Wall frame: W,state,fill_pct\n; state: 0=clear, 1=too close.
 # fill_pct is the blue share of the wall ROI in percent, for tuning only.
+# Arrival frame: A,state,fill_pct\n; state: 1 when black area exceeds 40%.
 
 import sensor
 import time
@@ -20,17 +21,26 @@ RED_TYPE = 1
 YELLOW_TYPE = 2
 BLACK_TYPE = 3
 
-# 0 = search red/yellow blocks, 1 = search the black unload area.
+# -1 = wait for STM32 command, 0 = red/yellow blocks, 1 = black unload area.
+# Starting idle ensures target locking begins only after an explicit M,0.
 detection_mode = 0
 
 # Latched wall flag. Kept across frames so the enter/exit thresholds
 # can act as hysteresis instead of both being compared every frame.
 wall_state = 0
 
+# Red/yellow target lock. A locked target is matched by color, position, and
+# apparent size instead of selecting the largest blob again every frame.
+locked_target = None
+LOCK_LOST_PAUSE_MS = 1300
+lock_pause_started_ms = None
+LOCK_MAX_MOVE_PX = 100
+LOCK_MIN_SIZE_RATIO = 0.35
+LOCK_MAX_SIZE_RATIO = 3.0
 
 def read_stm32_mode():
     """Apply the latest M,0 / M,1 command sent by the STM32."""
-    global detection_mode
+    global detection_mode, locked_target, lock_pause_started_ms
     while uart.any():
         line = uart.readline()
         if not line:
@@ -43,6 +53,8 @@ def read_stm32_mode():
             detection_mode = 0
         elif text == "M,1":
             detection_mode = 1
+            locked_target = None
+            lock_pause_started_ms = None
 
 
 def send_target(color, cx, cy, distance_cm):
@@ -58,6 +70,10 @@ def send_wall(wall_state, fill_pct):
     uart.write("W,%d,%d\n" % (wall_state, fill_pct))
 
 
+def send_arrival(arrived, fill_pct):
+    uart.write("A,%d,%d\n" % (arrived, fill_pct))
+
+
 def largest_blob(candidates):
     """Return (blob, color config) having the largest pixel count."""
     target = None
@@ -66,6 +82,37 @@ def largest_blob(candidates):
             target = candidate
     return target
 
+def matching_locked_blob(candidates, lock):
+    """Return the candidate most similar to the previously locked target."""
+    best = None
+    best_score = None
+    old_type, old_cx, old_cy, old_w, old_h = lock
+
+    for candidate in candidates:
+        blob = candidate[0]
+        if candidate[1] != old_type:
+            continue
+
+        dx = blob.cx - old_cx
+        dy = blob.cy - old_cy
+        if abs(dx) > LOCK_MAX_MOVE_PX or abs(dy) > LOCK_MAX_MOVE_PX:
+            continue
+
+        width_ratio = blob.w / old_w
+        height_ratio = blob.h / old_h
+        if width_ratio < LOCK_MIN_SIZE_RATIO or width_ratio > LOCK_MAX_SIZE_RATIO:
+            continue
+        if height_ratio < LOCK_MIN_SIZE_RATIO or height_ratio > LOCK_MAX_SIZE_RATIO:
+            continue
+
+        # Position is the strongest identity cue; size changes as the car moves.
+        size_error = abs(blob.w - old_w) + abs(blob.h - old_h)
+        score = (dx * dx) + (dy * dy) + (size_error * size_error)
+        if best is None or score < best_score:
+            best = candidate
+            best_score = score
+
+    return best
 sensor.reset()
 sensor.set_pixformat(sensor.RGB565)
 sensor.set_framesize(sensor.QVGA)
@@ -96,43 +143,42 @@ color_configs = (
 BLACK_CONFIG = (BLACK_TYPE, "BLACK", (0, 29, -15, 18, -21, -1), (0, 0, 255), 400.0)
 # The area is a large floor region, so it needs a bigger blob and merging.
 BLACK_PIXELS_THRESHOLD = 300
+BLACK_ARRIVAL_FILL_PCT = 40
 # Reported distance per pixel of gap below the area's near edge.
 # Increase it if the car stops too early, decrease it if it overshoots.
 BLACK_NEAR_EDGE_CM_PER_PX = 0.3
 
 # Always-enabled blue wall collision region. Its distance is estimated from
 # the blue wall's apparent width using a measured real width.
-WALL_ROI = (0, 80, IMAGE_WIDTH, IMAGE_HEIGHT - 80)
+WALL_ROI = (0, 0, IMAGE_WIDTH, IMAGE_HEIGHT - 0)
 WALL_ROI_AREA_PX = WALL_ROI[2] * WALL_ROI[3]
-BLUE_WALL_THRESHOLD = (21, 61, -97, 65, -85, -33)
+BLUE_WALL_THRESHOLD = (0, 68, -30, 20, -59, -13)
 BLUE_WALL_COLOR = (0, 120, 255)
-WALL_MIN_WIDTH_PX = 30
-WALL_MIN_HEIGHT_PX = 20
-WALL_PIXELS_THRESHOLD = 200
+WALL_MIN_WIDTH_PX = 15
+WALL_MIN_HEIGHT_PX = 10
+WALL_PIXELS_THRESHOLD = 60
 
 # The wall is judged by how much of the ROI is blue, not by an estimated
 # distance: a wall wider than the frame saturates any width-based distance,
 # but its pixel share keeps growing all the way in.
 # Two thresholds give hysteresis, so the flag does not chatter at the edge.
-# Calibrate by parking the car where it should back off and reading the
-# reported percentage from the STM32 telemetry field vwall_pct.
-WALL_FILL_ENTER_PCT = 30
-WALL_FILL_EXIT_PCT = 20
+# Calibrate by reading the percentage reported to the STM32.
+WALL_FILL_ENTER_PCT = 95
+WALL_FILL_EXIT_PCT = 90
 
 # Smaller values make detection more sensitive, but may also detect noise.
 # QVGA blob area is a quarter of the VGA area for the same object.
 PIXELS_THRESHOLD = 20
 AREA_THRESHOLD = 20
 
-# Shape filters for cube/cylinder side views.
+# Shape filters for cube/cylinder side views
 # Reject thin wires, tiny regions, and sparse color noise.
 MIN_ASPECT_RATIO = 0.5
 MAX_ASPECT_RATIO = 2.0
 MIN_BLOB_WIDTH = 4
 MIN_BLOB_HEIGHT = 4
-# Focal length in pixels. This is the calibration constant.
-# It scales with resolution, so QVGA uses half of the VGA value.
-# Tune this by measuring a known distance once and adjusting.
+
+# QVGA focal-length calibration used for red/yellow block distance.
 FOCAL_LENGTH_PX = 185
 
 clock = time.clock()
@@ -143,11 +189,16 @@ while True:
     img = sensor.snapshot()
     candidates = []
 
+    lock_pause_active = False
+    if lock_pause_started_ms is not None:
+        elapsed_ms = time.ticks_diff(time.ticks_ms(), lock_pause_started_ms)
+        if elapsed_ms < LOCK_LOST_PAUSE_MS:
+            lock_pause_active = True
+        else:
+            lock_pause_started_ms = None
+
     # This collision check always runs, regardless of the STM32-selected mode.
-    # Sum every blue region that passes the noise filter: the wall can be split
-    # into several blobs by a block standing in front of it or by uneven light,
-    # and what matters is the total blue share of the view, not one blob.
-    wall_pixels = 0
+    # Find the largest blue blob only and use its bounding box area ratio.
     wall_blob = None
     for blob in img.find_blobs(
         [BLUE_WALL_THRESHOLD],
@@ -158,12 +209,14 @@ while True:
     ):
         if blob.w < WALL_MIN_WIDTH_PX or blob.h < WALL_MIN_HEIGHT_PX:
             continue
-        wall_pixels += blob.pixels
         if wall_blob is None or blob.pixels > wall_blob.pixels:
             wall_blob = blob
 
     # Clamped because the STM32 rejects the frame as malformed above 100.
-    wall_fill_pct = min(100, int(100 * wall_pixels / WALL_ROI_AREA_PX))
+    if wall_blob is None:
+        wall_fill_pct = 0
+    else:
+        wall_fill_pct = min(100, int(100 * wall_blob.w * wall_blob.h / WALL_ROI_AREA_PX))
     if wall_fill_pct >= WALL_FILL_ENTER_PCT:
         wall_state = 1
     elif wall_fill_pct <= WALL_FILL_EXIT_PCT:
@@ -177,10 +230,11 @@ while True:
             color=BLUE_WALL_COLOR,
             scale=1,
         )
+    print(wall_state, wall_fill_pct)
     send_wall(wall_state, wall_fill_pct)
 
 
-    if detection_mode != 0:
+    if detection_mode == 1:
         green_led.off()
         blue_led.on()
         # Unload area: one large merged region, no cube shape filtering.
@@ -199,7 +253,7 @@ while True:
                 box_color,
                 known_width_mm,
             ))
-    else:
+    elif detection_mode == 0 and not lock_pause_active:
         blue_led.off()
         green_led.on()
         # Detect each color separately, then select one global largest valid blob.
@@ -230,10 +284,38 @@ while True:
                     box_color,
                     known_width_mm,
                 ))
+    elif detection_mode == 0:
+        blue_led.off()
+        green_led.off()
+    else:
+        green_led.off()
+        blue_led.off()
 
-    target = largest_blob(candidates)
+    if detection_mode == 1:
+        target = largest_blob(candidates)
+    elif detection_mode == 0:
+        if lock_pause_active:
+            target = None
+        elif locked_target is None:
+            target = largest_blob(candidates)
+            if target is not None:
+                blob = target[0]
+                locked_target = (target[1], blob.cx, blob.cy, blob.w, blob.h)
+        else:
+            target = matching_locked_blob(candidates, locked_target)
+            if target is None:
+                locked_target = None
+                lock_pause_started_ms = time.ticks_ms()
+            else:
+                blob = target[0]
+                locked_target = (target[1], blob.cx, blob.cy, blob.w, blob.h)
+    else:
+        target = None
+
     if target is None:
-        print("No target found, mode", detection_mode)
+        print("No target found, mode", detection_mode, "pause", lock_pause_active)
+        if detection_mode == 1:
+            send_arrival(0, 0)
         send_target(0, 0, 0, 0)
         continue
 
@@ -246,6 +328,18 @@ while True:
     cy = blob.cy
 
     if object_type == BLACK_TYPE:
+        # For a floor/unload region, the useful steering point is the center of
+        # its near (bottom) edge, not the center of the whole black rectangle.
+        cx = x + (w // 2)
+        cy = min(y + h - 1, IMAGE_HEIGHT - 1)
+
+        black_fill_pct = min(
+            100,
+            int(100 * w * h / (IMAGE_WIDTH * IMAGE_HEIGHT)),
+        )
+        black_arrived = 1 if black_fill_pct > BLACK_ARRIVAL_FILL_PCT else 0
+        send_arrival(black_arrived, black_fill_pct)
+
         # A floor region fills the frame when close, so its width saturates.
         # Use the gap between its near edge and the image bottom instead:
         # the gap shrinks to zero as the car drives onto the area.
