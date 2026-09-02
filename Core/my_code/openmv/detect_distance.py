@@ -1,4 +1,4 @@
-# OpenMV -> STM32 USART2 visual transmission test.
+# OpenMV -> STM32  USART2 visual transmission test.
 # Frame: V,color,cx,cy,distance_cm\n
 # color: 0=none, 1=red, 2=yellow, 3=black unload area.
 # STM32 command: M,0\n=block mode, M,1\n=black unload area mode.
@@ -23,7 +23,7 @@ BLACK_TYPE = 3
 
 # -1 = wait for STM32 command, 0 = red/yellow blocks, 1 = black unload area.
 # Starting idle ensures target locking begins only after an explicit M,0.
-detection_mode = 0
+detection_mode = 1
 
 # Latched wall flag. Kept across frames so the enter/exit thresholds
 # can act as hysteresis instead of both being compared every frame.
@@ -143,7 +143,7 @@ color_configs = (
 BLACK_CONFIG = (BLACK_TYPE, "BLACK", (0, 29, -15, 18, -21, -1), (0, 0, 255), 400.0)
 # The area is a large floor region, so it needs a bigger blob and merging.
 BLACK_PIXELS_THRESHOLD = 300
-BLACK_ARRIVAL_FILL_PCT = 40
+BLACK_ARRIVAL_FILL_PCT = 20
 # Reported distance per pixel of gap below the area's near edge.
 # Increase it if the car stops too early, decrease it if it overshoots.
 BLACK_NEAR_EDGE_CM_PER_PX = 0.3
@@ -164,7 +164,7 @@ WALL_PIXELS_THRESHOLD = 60
 # Two thresholds give hysteresis, so the flag does not chatter at the edge.
 # Calibrate by reading the percentage reported to the STM32.
 WALL_FILL_ENTER_PCT = 95
-WALL_FILL_EXIT_PCT = 90
+WALL_FILL_EXIT_PCT = 75
 
 # Smaller values make detection more sensitive, but may also detect noise.
 # QVGA blob area is a quarter of the VGA area for the same object.
@@ -286,7 +286,7 @@ while True:
                 ))
     elif detection_mode == 0:
         blue_led.off()
-        green_led.off()
+        green_led.on()
     else:
         green_led.off()
         blue_led.off()
@@ -339,6 +339,7 @@ while True:
         )
         black_arrived = 1 if black_fill_pct > BLACK_ARRIVAL_FILL_PCT else 0
         send_arrival(black_arrived, black_fill_pct)
+        print("BLACK", black_arrived, black_fill_pct)
 
         # A floor region fills the frame when close, so its width saturates.
         # Use the gap between its near edge and the image bottom instead:
