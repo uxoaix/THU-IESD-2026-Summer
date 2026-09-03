@@ -33,6 +33,10 @@
  *   预测: θ_pred = θ_prev + ω_imu·dt              (陀螺短期推算)
  *   绝对修正: θ_corr = θ_enc + γ·wrap(θ_imu - θ_enc)  (IMU 与编码器按 γ 混合)
  *   融合: θ = θ_pred + (1-α)·wrap(θ_corr - θ_pred)  (预测为主, 绝对源长期拉回)
+ *
+ *   对外出口统一做标度校准 (FUSION_YAW_SCALE): 滤波器内部保持原始航向空间,
+ *   只把"相对归零点的增量"按系数缩放后发布, 用一个系数同时修正定角旋转、
+ *   里程计 (x,y) 和返航方位角。
  */
 #include "sensor_fusion.h"
 #include "imu_processor.h"
@@ -53,6 +57,12 @@ static float s_kf_P11 = FUSION_KF_P0_RATE;
 
 /* 互补滤波状态 */
 static float s_comp_theta = 0.0f;      /* 上周期融合航向 */
+
+/* 标度校准 (见 FUSION_YAW_SCALE)
+ *   对外航向 = s_yaw_ref + FUSION_YAW_SCALE · (原始融合航向 - s_yaw_ref)
+ *   滤波器内部一律用原始量, 只在对外出口缩放, 避免污染 IMU 绝对参考。 */
+static float s_yaw_ref   = 0.0f;       /* 上次归零时的原始航向 (缩放基准) */
+static float s_theta_raw = 0.0f;       /* 未缩放的融合航向 */
 
 /* 直线速度 */
 static float s_lin_vel_cms = 0.0f;     /* 当前融合速度 */
@@ -246,6 +256,8 @@ void SensorFusion_Init(void)
     s_kf_P11   = FUSION_KF_P0_RATE;
 
     s_comp_theta  = 0.0f;
+    s_yaw_ref     = 0.0f;
+    s_theta_raw   = 0.0f;
     s_lin_vel_cms = 0.0f;
     s_lin_vel_prev = 0.0f;
 
@@ -265,12 +277,13 @@ void SensorFusion_Init(void)
 void SensorFusion_SetMode(FusionMode_t mode)
 {
     s_mode = mode;
-    /* 切到卡尔曼时, 把当前航向同步进卡尔曼状态, 避免跳变 */
+    /* 切模式时把当前航向同步进目标滤波器状态, 避免跳变。
+     * 必须用未缩放的 s_theta_raw: 滤波器内部工作在原始航向空间。 */
     if (mode == FUSION_MODE_KALMAN) {
-        s_kf_theta = s_state.heading_rad;
+        s_kf_theta = s_theta_raw;
     }
     if (mode == FUSION_MODE_COMPLEMENTARY) {
-        s_comp_theta = s_state.heading_rad;
+        s_comp_theta = s_theta_raw;
     }
 }
 
@@ -352,9 +365,11 @@ void SensorFusion_Update(const WheelFeedback_t *wheels, float dt)
     s_lin_vel_prev = v_out;
     s_lin_vel_cms  = v_out;
 
-    /* ⑥ 刷新对外状态 */
-    s_state.heading_rad     = theta_out;
-    s_state.yaw_rate_radps  = omega_out;
+    /* ⑥ 刷新对外状态 (航向/角速度过标度校准, 见 FUSION_YAW_SCALE) */
+    s_theta_raw             = theta_out;
+    s_state.heading_rad     = s_yaw_ref +
+                              FUSION_YAW_SCALE * (theta_out - s_yaw_ref);
+    s_state.yaw_rate_radps  = omega_out * FUSION_YAW_SCALE;
     s_state.linear_vel_cms  = v_out;
     s_state.heading_imu_rad = theta_imu;
     s_state.heading_enc_rad = s_enc_heading;
@@ -395,6 +410,10 @@ void SensorFusion_ResetHeading(void)
         const float DEG2RAD = 3.14159265358979f / 180.0f;
         theta0 = imu.angle_deg[2] * DEG2RAD * FUSION_IMU_YAW_SIGN;
     }
+
+    /* 标度基准跟着归零点走: 之后的缩放只作用于相对该点的增量。 */
+    s_yaw_ref           = theta0;
+    s_theta_raw         = theta0;
 
     s_enc_heading       = theta0;
     s_enc_heading_prev  = theta0;

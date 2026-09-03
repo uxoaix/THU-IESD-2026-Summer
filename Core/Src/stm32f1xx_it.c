@@ -23,7 +23,6 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "openmv_uart.h"
-#include "ultrasonic_front.h"
 #include "hc05_uart.h"   /* HC-05 蓝牙在 UART4@115200, PC10/PC11 */
 #include "imu_driver.h"  /* JY901S IMU 在 USART3@115200, PB10/PB11 */
 #include "tim.h"
@@ -435,14 +434,6 @@ void UART4_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
-
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-  if (GPIO_Pin == GPIO_PIN_12)
-  {
-    UltrasonicFront_OnEchoEdge();
-  }
-}
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {

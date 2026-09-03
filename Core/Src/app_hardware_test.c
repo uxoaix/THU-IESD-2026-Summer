@@ -14,7 +14,7 @@
  *   TELEMETRY_PERIOD_MS = 200ms —— 打印 T,tick,四个速度,四个duty,四个fault
  *
  * 【和 AppCore_Run 的区别】
- *   - 没有 MotionStrategy / OpenMV / UltrasonicFront (视觉和超声不参与)
+ *   - 没有 MotionStrategy / OpenMV (视觉不参与)
  *   - TriggerIdleServos 让四路舵机一直循环往复 —— 验证舵机电路
  *   - MOTOR_TARGET_MM_S 默认 0, 想测电机改这个宏
  *

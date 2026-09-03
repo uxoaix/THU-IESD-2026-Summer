@@ -15,6 +15,14 @@
  *   color: 0=无目标, 1=红色, 2=黄色, 3=黑区。
  *   cx/cy 是QVGA原始中心坐标，接收后自动换算相对画面中心的偏移。
  *
+ *   W,state,fill_pct\n  —— 蓝色场地边界墙，OpenMV 每帧都发，与识别模式无关。
+ *   state: 0=安全, 1=已近到需要退避 (OpenMV 侧已做迟滞)。
+ *   fill_pct 是蓝色占墙 ROI 的百分比，只用于标定阈值时观察。
+ *
+ *   A,state,fill_pct\n  —— 黑区到位，只在黑区模式 (M,1) 下逐帧发送。
+ *   state: 1=黑区面积已超阈值，可以掉头卸货。
+ *   fill_pct 是黑区外框占整幅画面的百分比，用于标定 OpenMV 侧阈值。
+ *
  * 【保护机制】
  *   - VISION_STALE_MS = 500ms —— 如果 500ms 没收到新帧, GetLatest 自动把 detected 清 0
  *   - 环形缓冲区满了就丢字节 (s_invalid_frames++), 不阻塞中断
@@ -45,6 +53,10 @@ static volatile uint16_t s_read_index;
 static char s_line[LINE_BUFFER_SIZE];
 static uint8_t s_line_length;
 static VisionData_t s_latest;
+static VisionWallData_t s_wall;
+static uint32_t s_wall_frames;
+static VisionArrivalData_t s_arrival;
+static uint32_t s_arrival_frames;
 static uint32_t s_valid_frames;
 static uint32_t s_invalid_frames;
 static uint8_t s_detection_mode = 0xFFU;
@@ -62,7 +74,41 @@ static void ParseLine(const char *line)
   unsigned int center_x;
   unsigned int center_y;
   unsigned int distance;
+  unsigned int state;
+  unsigned int fill_pct;
   char extra;
+
+  /* 蓝墙帧/到位帧/目标帧混在同一条串口上, 先按前缀分流。 */
+  if (sscanf(line, "W,%u,%u%c", &state, &fill_pct, &extra) == 2)
+  {
+    if ((state <= 1U) && (fill_pct <= 100U))
+    {
+      s_wall.blocked = (uint8_t)state;
+      s_wall.fill_pct = (uint8_t)fill_pct;
+      s_wall.valid = 1U;
+      s_wall.timestamp_ms = HAL_GetTick();
+      /* 单独计数: W 帧每帧都发, 混进 s_valid_frames 会掩盖"V 帧没来"。 */
+      s_wall_frames++;
+      return;
+    }
+    s_invalid_frames++;
+    return;
+  }
+
+  if (sscanf(line, "A,%u,%u%c", &state, &fill_pct, &extra) == 2)
+  {
+    if ((state <= 1U) && (fill_pct <= 100U))
+    {
+      s_arrival.arrived = (uint8_t)state;
+      s_arrival.fill_pct = (uint8_t)fill_pct;
+      s_arrival.valid = 1U;
+      s_arrival.timestamp_ms = HAL_GetTick();
+      s_arrival_frames++;
+      return;
+    }
+    s_invalid_frames++;
+    return;
+  }
 
   /*
    * 尾部%c用于拒绝字段过多的帧；标准四字段帧只会成功转换4项。
@@ -117,6 +163,10 @@ static void ParseLine(const char *line)
 void OpenMvUart_Init(void)
 {
   memset(&s_latest, 0, sizeof(s_latest));
+  memset(&s_wall, 0, sizeof(s_wall));
+  s_wall_frames = 0U;
+  memset(&s_arrival, 0, sizeof(s_arrival));
+  s_arrival_frames = 0U;
   s_write_index = 0U;
   s_read_index = 0U;
   s_line_length = 0U;
@@ -197,36 +247,91 @@ void OpenMvUart_GetLatest(VisionData_t *vision)
 }
 
 /* --------------------------------------------------------------------------
+ * 【函数】OpenMvUart_GetWall
+ * 【作用】对外提供最新的蓝墙检测结果, 中断安全 + 超时自动清零
+ * 【超时保护】OpenMV 每帧都发 W 帧, 所以超过 VISION_STALE_MS 没收到
+ *             说明链路断了; 此时 valid=0 且 blocked=0, 上层不会被误触发退避
+ * ------------------------------------------------------------------------- */
+void OpenMvUart_GetWall(VisionWallData_t *wall)
+{
+  uint32_t primask = __get_PRIMASK();
+
+  __disable_irq();
+  *wall = s_wall;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+
+  if ((uint32_t)(HAL_GetTick() - wall->timestamp_ms) > VISION_STALE_MS)
+  {
+    wall->blocked = 0U;
+    wall->fill_pct = 0U;
+    wall->valid = 0U;
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * 【函数】OpenMvUart_GetArrival
+ * 【作用】对外提供最新的黑区到位判定, 中断安全 + 超时自动清零
+ * 【超时保护】A 帧只在黑区模式下发送, 物块模式必然超时;
+ *             超时后 arrived=0, 所以物块阶段不可能误判"到位"
+ * ------------------------------------------------------------------------- */
+void OpenMvUart_GetArrival(VisionArrivalData_t *arrival)
+{
+  uint32_t primask = __get_PRIMASK();
+
+  __disable_irq();
+  *arrival = s_arrival;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+
+  if ((uint32_t)(HAL_GetTick() - arrival->timestamp_ms) > VISION_STALE_MS)
+  {
+    arrival->arrived = 0U;
+    arrival->fill_pct = 0U;
+    arrival->valid = 0U;
+  }
+}
+
+/* --------------------------------------------------------------------------
  * 【函数】OpenMvUart_SetDetectionMode
  * 【作用】给 OpenMV 发模式切换指令 —— "M,0"=色块识别, "M,1"=黑线识别
- * 【防抖】如果目标模式和当前一样, 直接 return 不重复发指令
+ * 【重发】模式不变时按 OPENMV_MODE_REFRESH_MS 周期性重发:
+ *         OpenMV 单独重启会丢掉模式(默认回色块), 只在切换时发一次会失步
  * 【调用方】运动策略根据任务需要自动切换 (比如循迹时切黑线模式)
  * ------------------------------------------------------------------------- */
 void OpenMvUart_SetDetectionMode(uint8_t black_area_mode)
 {
   static const uint8_t block_command[] = "M,0\n";
   static const uint8_t black_command[] = "M,1\n";
+  static uint32_t s_mode_sent_tick;
+  uint32_t now = HAL_GetTick();
   uint8_t mode = (black_area_mode != 0U) ? 1U : 0U;
 
-  if (mode == s_detection_mode)
+  if (mode == s_detection_mode &&
+      (uint32_t)(now - s_mode_sent_tick) < OPENMV_MODE_REFRESH_MS)
   {
     return;
   }
 
   s_detection_mode = mode;
+  s_mode_sent_tick = now;
   if (mode != 0U)
   {
     HAL_UART_Transmit(&huart2,
                       (uint8_t *)black_command,
                       sizeof(black_command) - 1U,
-                      10U);
+                      50U);
   }
   else
   {
     HAL_UART_Transmit(&huart2,
                       (uint8_t *)block_command,
                       sizeof(block_command) - 1U,
-                      10U);
+                      50U);
   }
 }
 
@@ -240,6 +345,18 @@ uint32_t OpenMvUart_GetValidFrameCount(void)
 uint32_t OpenMvUart_GetInvalidFrameCount(void)
 {
   return s_invalid_frames;
+}
+
+/* 只读蓝墙帧计数 (诊断用 —— OpenMV 每帧都发 W, 所以它反映的是链路帧率) */
+uint32_t OpenMvUart_GetWallFrameCount(void)
+{
+  return s_wall_frames;
+}
+
+/* 只读到位帧计数 (诊断用 —— 只在黑区模式下增长, 可用来确认 M,1 已生效) */
+uint32_t OpenMvUart_GetArrivalFrameCount(void)
+{
+  return s_arrival_frames;
 }
 
 /* --------------------------------------------------------------------------
