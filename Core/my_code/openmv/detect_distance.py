@@ -4,7 +4,7 @@
 # STM32 command: M,0\n=block mode, M,1\n=black unload area mode.
 # Wall frame: W,state,fill_pct\n; state: 0=clear, 1=too close.
 # fill_pct is the blue share of the wall ROI in percent, for tuning only.
-# Arrival frame: A,state,fill_pct\n; state: 1 when black area exceeds 40%.
+# Arrival frame: A,state,fill_pct\n; fill_pct uses actual black pixels.
 
 import sensor
 import time
@@ -23,7 +23,7 @@ BLACK_TYPE = 3
 
 # -1 = wait for STM32 command, 0 = red/yellow blocks, 1 = black unload area.
 # Starting idle ensures target locking begins only after an explicit M,0.
-detection_mode = 1
+detection_mode = 0
 
 # Latched wall flag. Kept across frames so the enter/exit thresholds
 # can act as hysteresis instead of both being compared every frame.
@@ -81,6 +81,44 @@ def largest_blob(candidates):
         if target is None or candidate[0].pixels > target[0].pixels:
             target = candidate
     return target
+
+
+def box_overlap_ratio(inner_blob, outer_blob):
+    """Return how much of inner_blob's axis-aligned box is covered by outer_blob."""
+    left = max(inner_blob.x, outer_blob.x)
+    top = max(inner_blob.y, outer_blob.y)
+    right = min(inner_blob.x + inner_blob.w, outer_blob.x + outer_blob.w)
+    bottom = min(inner_blob.y + inner_blob.h, outer_blob.y + outer_blob.h)
+
+    if right <= left or bottom <= top:
+        return 0.0
+
+    return ((right - left) * (bottom - top)) / (inner_blob.w * inner_blob.h)
+
+
+def diagonal_intersection(corners, fallback_x, fallback_y):
+    """Return the intersection of diagonals 0-2 and 1-3."""
+    x1, y1 = corners[0]
+    x2, y2 = corners[2]
+    x3, y3 = corners[1]
+    x4, y4 = corners[3]
+
+    denominator = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if denominator == 0:
+        return fallback_x, fallback_y
+
+    first_cross = x1 * y2 - y1 * x2
+    second_cross = x3 * y4 - y3 * x4
+    center_x = int(
+        (first_cross * (x3 - x4) - (x1 - x2) * second_cross)
+        / denominator
+    )
+    center_y = int(
+        (first_cross * (y3 - y4) - (y1 - y2) * second_cross)
+        / denominator
+    )
+    return center_x, center_y+10
+
 
 def matching_locked_blob(candidates, lock):
     """Return the candidate most similar to the previously locked target."""
@@ -140,10 +178,13 @@ color_configs = (
 )
 
 # Black unload area. Threshold must be re-tuned on the real field.
-BLACK_CONFIG = (BLACK_TYPE, "BLACK", (0, 29, -15, 18, -21, -1), (0, 0, 255), 400.0)
+BLACK_CONFIG = (BLACK_TYPE, "BLACK", (0, 35, -15, 18, -21, 10), (0, 0, 255), 400.0)
 # The area is a large floor region, so it needs a bigger blob and merging.
 BLACK_PIXELS_THRESHOLD = 300
-BLACK_ARRIVAL_FILL_PCT = 20
+BLACK_ARRIVAL_FILL_PCT = 15
+# In red/yellow mode, ignore an object covered by this proportion of the
+# largest black unload-area bounding box.
+BLACK_OVERLAP_REJECT_RATIO = 0.90
 # Reported distance per pixel of gap below the area's near edge.
 # Increase it if the car stops too early, decrease it if it overshoots.
 BLACK_NEAR_EDGE_CM_PER_PX = 0.3
@@ -256,6 +297,18 @@ while True:
     elif detection_mode == 0 and not lock_pause_active:
         blue_led.off()
         green_led.on()
+        black_area_blob = None
+        black_threshold = BLACK_CONFIG[2]
+        for black_blob in img.find_blobs(
+            [black_threshold],
+            roi=roi,
+            pixels_threshold=BLACK_PIXELS_THRESHOLD,
+            area_threshold=BLACK_PIXELS_THRESHOLD,
+            merge=True,
+        ):
+            if black_area_blob is None or black_blob.pixels > black_area_blob.pixels:
+                black_area_blob = black_blob
+
         # Detect each color separately, then select one global largest valid blob.
         for object_type, color_name, threshold, box_color, known_width_mm in color_configs:
             blobs = img.find_blobs(
@@ -276,6 +329,12 @@ while True:
                 aspect_ratio = w / h
                 if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
                     continue
+
+                if black_area_blob is not None:
+                    overlap_ratio = box_overlap_ratio(blob, black_area_blob)
+                    if overlap_ratio >= BLACK_OVERLAP_REJECT_RATIO:
+                        print("Ignore", color_name, "in black area")
+                        continue
 
                 candidates.append((
                     blob,
@@ -326,16 +385,30 @@ while True:
     h = blob.h
     cx = blob.cx
     cy = blob.cy
+    black_corners = None
 
     if object_type == BLACK_TYPE:
-        # For a floor/unload region, the useful steering point is the center of
-        # its near (bottom) edge, not the center of the whole black rectangle.
-        cx = x + (w // 2)
-        cy = min(y + h - 1, IMAGE_HEIGHT - 1)
+        # Use the minimum rotated rectangle and the intersection of its
+        # diagonals, so a slanted black unload area is not centered from the
+        # axis-aligned bounding box.
+        try:
+            black_corners = blob.min_corners
+            if callable(black_corners):
+                black_corners = black_corners()
+            if len(black_corners) == 4:
+                cx, cy = diagonal_intersection(black_corners, blob.cx, blob.cy)
+            else:
+                black_corners = None
+        except Exception:
+            black_corners = None
+            cx = blob.cx
+            cy = blob.cy
 
+        # Use actual threshold-matched pixels, not the axis-aligned w*h box.
+        # This excludes non-black background inside a slanted bounding box.
         black_fill_pct = min(
             100,
-            int(100 * w * h / (IMAGE_WIDTH * IMAGE_HEIGHT)),
+            int(100 * blob.pixels / (IMAGE_WIDTH * IMAGE_HEIGHT)),
         )
         black_arrived = 1 if black_fill_pct > BLACK_ARRIVAL_FILL_PCT else 0
         send_arrival(black_arrived, black_fill_pct)
@@ -353,10 +426,20 @@ while True:
         distance_mm = (FOCAL_LENGTH_PX * known_width_mm) / w
         distance_cm = int(distance_mm / 10.0)
 
-    img.draw_rectangle(blob.rect, color=box_color, thickness=2)
+    if black_corners is not None:
+        for corner_index in range(4):
+            next_index = (corner_index + 1) % 4
+            x1, y1 = black_corners[corner_index]
+            x2, y2 = black_corners[next_index]
+            img.draw_line((x1, y1, x2, y2), color=box_color, thickness=2)
+    else:
+        img.draw_rectangle(blob.rect, color=box_color, thickness=2)
     img.draw_cross((cx, cy), color=box_color, size=5, thickness=2)
     label_y = max(y - 12, 0)
-    label = "%s %.1fmm" % (color_name, distance_mm)
+    if object_type == BLACK_TYPE:
+        label = "%s %d%%" % (color_name, black_fill_pct)
+    else:
+        label = "%s %.1fmm" % (color_name, distance_mm)
     img.draw_string((x, label_y), label, color=box_color, scale=1)
 
     print("TX", object_type, cx, cy, distance_cm)
