@@ -141,7 +141,7 @@ typedef struct {
  * 只管一次原地扫视; 这个跨状态累加, ROTATE_SEARCH <-> SEARCH_RELOCATE 的
  * 往返和蓝墙退避都不会把它清零, 只有真的看见物块才归零。
  */
-#define SEARCH_GIVE_UP_MS                60000U
+#define SEARCH_GIVE_UP_MS                40000U
 #define TARGET_LOCK_WINDOW_MS            800U
 #define PRE_CENTERING_TIMEOUT_MS         2000U
 #define TRACKING_COMPLETE_MIN_FORWARD_MS 200U /* 至少前进一段时间后才允许判定追踪完成 */
@@ -205,6 +205,27 @@ typedef struct {
 #define HOME_PARTIAL_RETURN_RATIO        0.75f  /* 直线段只走全程的3/4 */
 #define HOME_FOLLOW_TIMEOUT_MS           10000U /* 直线段兜底超时 */
 #define HOME_ARRIVAL_RADIUS_CM           12.0f
+/*
+ * 返航途中的视觉交接: 直线段全程 OpenMV 都处于黑区模式, 一旦确认看见黑区就
+ * 直接进 BLACK_AREA_TRACK, 不必等走满 HOME_PARTIAL_RETURN_RATIO。
+ *
+ * 为什么要这么做: 卸货区贴着墙, 车越接近家, 墙在画面里占比越大, 蓝墙退避会
+ * 在终点前把车推走 (HOME_FOLLOW 做退避, BLACK_AREA_TRACK 不做)。提前交给视觉
+ * 就是在墙近到触发退避之前把控制权切走, 从根上避开这个冲突; 顺带里程计漂移
+ * 只需要撑到"能看见黑区"那一刻。
+ *
+ * 为什么还要距离门限: OpenMV 的 BLACK_PIXELS_THRESHOLD 只有 300px (一帧的
+ * 0.4%), 阴影、黑胶带、深色底盘都够触发。而误判代价很重 ——
+ * BLACK_AREA_TRACK 丢失目标后走 ResumeSearch(), 此时 s_wall_black=1, 会进
+ * BLACK_AREA_SEARCH 原地扫视, 整个返航计划就此放弃, 车在半路上开始找黑区。
+ * 所以用里程计当粗筛: 只有它认为已经离家不远时才允许交接。里程计不负责精确
+ * 定位, 漂移只影响门限松紧, 不影响能否交接。
+ *
+ * CONFIRM_MS 要求连续这么久都看见, 滤掉单帧闪跳; 被蓝墙退避打断时计时清零
+ * (累加逻辑在 switch 之前, 只在 s_state 为 HOME_FOLLOW 时累加)。
+ */
+#define HOME_VISION_HANDOVER_CM          150.0f
+#define HOME_VISION_CONFIRM_MS           300U
 #define HOME_RETURN_SPEED_CM_S           23.0f  /* 20.0 */
 #define HOME_RETURN_HEADING_KP           1.2f
 #define HOME_RETURN_MAX_ANGULAR_RAD_S    0.8f
@@ -275,12 +296,18 @@ typedef struct {
 /* 转满一圈的判据 (留余量, 不用整 360 以免边界差一点点判不到) */
 #define SEARCH_FULL_CIRCLE_DEG           350.0f
 
-/* 12.1 搜索换位 (转满一圈没发现目标 → 直行一段换个视角重新搜)
- *   车上没有测距传感器, 所以方向和距离都是开环的: 沿当前朝向直行固定距离,
- *   撞墙风险由 OpenMV 蓝墙退避兜住 (见 12.2)。 */
-#define SEARCH_RELOCATE_DIST_CM          60.0f
+/* 12.1 搜索换位 (转满一圈没发现目标 → 走一段换个视角重新搜)
+ *   方向来自下面的扫视方向表 (不是盲走); 距离是开环的, 车上没有测距传感器,
+ *   途中撞墙不回本状态重走: 退避完直接回原地扫视重新挑方向 (见 12.2),
+ *   所以这段距离只在"一路无墙"时才会真的走满。 */
+#define SEARCH_RELOCATE_DIST_CM          120.0f /* 60.0 */
 #define SEARCH_RELOCATE_SPEED_CM_S       23.0f  /* 20.0 */
-#define SEARCH_RELOCATE_TIMEOUT_MS       8000U
+/*
+ * 超时只是里程计失效时的兜底, 必须留足于"正常走完全程"所需的时间, 否则
+ * 距离判据永远轮不到、每次换位都被超时截断: 120cm / 23cm/s ≈ 5.2s, 加上
+ * 起步加速和对准阶段, 给到 12s。
+ */
+#define SEARCH_RELOCATE_TIMEOUT_MS       12000U
 /*
  * 换位方向由"扫视方向表"决定, 不再盲走。
  *
@@ -311,6 +338,8 @@ typedef struct {
  *   动作是"后退 + 右转", 退到 OpenMV 不再报有墙为止。
  *   在所有"朝未知方向前进"的状态生效: ROTATE_SEARCH / SEARCH_RELOCATE /
  *   HOME_FOLLOW / BLACK_AREA_SEARCH。
+ *   退避结束后一般回被打断的那个状态, 但 SEARCH_RELOCATE 例外: 那个方向既然
+ *   被墙拦住, 就不回去重走剩下的距离, 直接回原地扫视重新挑方向。
  *   物块与黑区的最后接近段必须禁用: 前者要撞上去推进滚刷
  *   (COLLECT_DISTANCE_CM 只有 10cm), 后者要压到黑区上方才卸货。
  *   CLEAR_MS 要求连续这么久无墙才退出, 否则蓝墙在视野边缘闪烁时会
@@ -326,13 +355,18 @@ typedef struct {
  *      返航要的是绕过去继续走, 不是原地磨到墙不见;
  *   2) 退完把锁定的返航方位角一起右旋 HOME_BACKOFF_TURN_DEG, 车才真的走上
  *      新航线; 只转车不转方位角的话, 下一周期就被拧回原方位角撞回同一面墙。
- * 一次只偏 10°, 偏完继续走; 墙还在就再触发一次, 自然形成 10° 一档的绕行。
- * 速度沿用 WALL_BACKOFF_SPEED_CM_S (17.25cm/s), 0.8s 约后退 14cm。
+ * 一次偏 30°, 偏完继续走; 墙还在就再触发一次, 形成 30° 一档的绕行 ——
+ * 三次偏到 90° (沿墙方向), 单个循环约 1.8s, 在 10s 累计预算内够绕出去, 又比
+ * 45° 温和, 单次偏离航线没那么狠。
+ * 速度沿用 WALL_BACKOFF_SPEED_CM_S (17.25cm/s), 0.8s 约后退 14cm;
+ * 摊出来的转速 37.5°/s 对应回转半径约 26cm, 左右轮速差约 7cm/s。
+ * 若实测倒车弧线打滑、实际偏角不足, 优先加长 HOME_BACKOFF_DURATION_MS 把转速
+ * 摊低, 而不是减小角度。
  * 累计兜底仍是 WALL_STRUGGLE_TIMEOUT_MS: 10s 内绕不出去就放弃剩下的返航
  * 距离, 就地转 BLACK_AREA_SEARCH 用视觉找黑区。
  */
 #define HOME_BACKOFF_DURATION_MS         800U
-#define HOME_BACKOFF_TURN_DEG            10.0f
+#define HOME_BACKOFF_TURN_DEG            30.0f  /* 10.0 → 45.0 */
 /* 摊到整段上的转速; 改上面两个值时自动跟随。调用处取负 = 右转 (顺时针)。 */
 #define HOME_BACKOFF_TURN_DEG_S \
   (HOME_BACKOFF_TURN_DEG * 1000.0f / (float)HOME_BACKOFF_DURATION_MS)
