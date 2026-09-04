@@ -28,7 +28,7 @@ typedef enum {
   WHEEL_COUNT
 } WheelId_t;
 
-/* 2. 运动状态机定义 (19 态)
+/* 2. 运动状态机定义 (18 态)
  * 新增状态一律追加在末尾，避免改动已有状态的数值编号 (遥测 state= 字段)。
  * 拆除超声后，原墙扫五态 (WALL_SCAN_FIRST/SECOND、WALL_TURN_OPPOSITE、
  * WALL_SMALL_ROTATE、WALL_MEASURE_MOVE) 与超声避障 AVOID_TURN 一并删除，
@@ -135,13 +135,26 @@ typedef struct {
  */
 #define BLACK_SEARCH_TIMEOUT_MS          12500U
 /*
- * 找物块阶段的总兜底: 连续这么久没看见任何物块, 就认为场上已经没有能收的了,
- * 不再耗时间搜索, 带着已经收到的直接返航卸货 (收几个算几个)。
+ * 找物块阶段的总兜底: 距上次"滚刷收集成功"超过这么久就放弃本轮, 带着已经
+ * 收到的直接返航卸货 (收几个算几个)。
+ *
+ * 判据是收集成功而不是看见物块: 只有 BRUSH_COLLECT 走完整套滚刷+后斗动作、
+ * s_collected 真的加一时才清零。按"看见"清零挡不住两种常见卡死 —— 车盯着
+ * 一个够不到的物块反复对准, 或者每次追踪都在最后一刻丢失目标; 这两种情况下
+ * 视觉一直有目标, 计时被无限推迟, 车能在原地耗完整场时间。
+ *
+ * 也因此这个计时在收集阶段全程累加 (含 PRE_CENTERING / TARGET_TRACKING /
+ * FINAL_APPROACH / BRUSH_COLLECT), 不像只在搜索态计时那样漏掉上面那类卡死。
+ * 判定点在 ROTATE_SEARCH 与 SEARCH_RELOCATE: 所有路径最迟经过 BRUSH_COLLECT
+ * → SEARCH_CONTINUE 就会回到搜索态, 所以不必在每个状态里都查一遍。
+ *
  * 与 SEARCH_NO_TARGET_TIMEOUT_MS 的区别: 那个是单轮扫视转满一圈的判据,
- * 只管一次原地扫视; 这个跨状态累加, ROTATE_SEARCH <-> SEARCH_RELOCATE 的
- * 往返和蓝墙退避都不会把它清零, 只有真的看见物块才归零。
+ * 只管一次原地扫视; 这个跨状态累加, 状态往返和蓝墙退避都不清零。
+ *
+ * 注意这是"每收一个物块"的预算, 不是整轮的: 收满 TOTAL_OBJECTS_TO_COLLECT
+ * 需要连续多次都在预算内完成。若实测经常在还有物块时就提前返航, 加大这个值。
  */
-#define SEARCH_GIVE_UP_MS                40000U
+#define SEARCH_GIVE_UP_MS                30000U  /* 40000 */
 #define TARGET_LOCK_WINDOW_MS            800U
 #define PRE_CENTERING_TIMEOUT_MS         2000U
 #define TRACKING_COMPLETE_MIN_FORWARD_MS 200U /* 至少前进一段时间后才允许判定追踪完成 */
@@ -186,7 +199,7 @@ typedef struct {
 #define PRE_CENTERING_EXIT_PX            20
 #define TARGET_DISTANCE_MAX_CM           50U
 #define COLLECT_DISTANCE_CM              10U
-#define FINAL_APPROACH_DURATION_MS       1000U /* 追踪结束后保持追踪速度前进1秒 */
+#define FINAL_APPROACH_DURATION_MS       700U /* 追踪结束后保持追踪速度前进1秒 */
 /* 黑区到位判据: 由 OpenMV 的 A 帧直接给出 (见 §5.1), STM32 不再自己算距离。
  * 阈值 BLACK_ARRIVAL_FILL_PCT 在 detect_distance.py 里, 用遥测 arv_pct 标定。
  * 这里只做一层去抖: A 帧没有迟滞, 阴影和黑区连成一片时单帧占比会突跳,
@@ -198,43 +211,64 @@ typedef struct {
 #define BLACK_AREA_OBJECT_TYPE           3U
 #define TOTAL_OBJECTS_TO_COLLECT         5U
 
-/* 返航：编码器距离+IMU融合航向计算二维位置，直接直线驶向原点。
- * 直线段只走全程的一部分，随后交给OpenMV搜索黑色卸货区，
- * 用视觉消除里程计累计误差。 */
+/* 返航: 编码器距离 + 融合航向算出的二维位置, 直线驶向原点。
+ *
+ * 流程: HOME_PREPARE 记下此刻到原点的距离 d, 锁定朝向原点的方位角
+ *       → HOME_FOLLOW 朝该方位角直行, 只走 d 的 HOME_PARTIAL_RETURN_RATIO
+ *         (航向偏差大就先原地转, 见 HOME_ROTATE_IN_PLACE_DEG)
+ *       → 走完 / 已进 HOME_ARRIVAL_RADIUS_CM / 兜底超时 → BLACK_AREA_SEARCH
+ *       全程盯着黑区, 确认看见就直接交给 BLACK_AREA_TRACK。
+ *
+ * 为什么只走一部分而不是走到原点: 位置是编码器速度的二次积分, 打滑和标定
+ * 误差随路程累积, 走完全程终点会明显偏离原点。所以直线段只负责"把车带到
+ * 卸货区附近", 剩下的距离交给 OpenMV 认黑区, 用视觉消掉里程计的累计误差。
+ *
+ * 遇墙: 直线段撞墙时倒一小段并把锁定的方位角右旋 HOME_BACKOFF_TURN_DEG (8°),
+ * 沿新方位角继续往前拱; 墙还在就再来一档, 8° 一档地蹭出去, 期间一直盯着黑区,
+ * 看见就转 BLACK_AREA_TRACK 走后续流程 (见 §12.2 的 HOME_BACKOFF_*)。
+ * 累计 HOME_WALL_GIVEUP_MS 还绕不出去就放弃剩下的返航距离, 就地转
+ * BLACK_AREA_SEARCH 原地扫黑区。 */
 #define HOME_ORIGIN_WAIT_MS              1500U
-#define HOME_PARTIAL_RETURN_RATIO        0.75f  /* 直线段只走全程的3/4 */
-#define HOME_FOLLOW_TIMEOUT_MS           10000U /* 直线段兜底超时 */
+/* 直线段只走全程的这个比例, 余下距离作为退出阈值。
+ * 调大 = 更依赖里程计精度, 调小 = 更早交给视觉但可能离黑区太远看不见。 */
+#define HOME_PARTIAL_RETURN_RATIO        0.75f  /* 0.5 / 0.2 */
+/* 直线段兜底超时: 里程计异常 (比如打滑导致距离一直不减) 时也能往下走。 */
+#define HOME_FOLLOW_TIMEOUT_MS           20000U
+/* 到原点的判定半径。因为有 PARTIAL_RETURN_RATIO, 通常先按比例退出, 这个值
+ * 只是"出发时就已经离原点很近"的兜底判据。 */
 #define HOME_ARRIVAL_RADIUS_CM           12.0f
 /*
- * 返航途中的视觉交接: 直线段全程 OpenMV 都处于黑区模式, 一旦确认看见黑区就
- * 直接进 BLACK_AREA_TRACK, 不必等走满 HOME_PARTIAL_RETURN_RATIO。
+ * 返航途中的视觉交接: 返航全程 OpenMV 都处于黑区模式, 一旦连续
+ * HOME_VISION_CONFIRM_MS 都看见黑区就直接进 BLACK_AREA_TRACK。
+ * CONFIRM_MS 用来滤掉单帧闪跳; 被蓝墙退避打断时计时清零 (累加逻辑在 switch
+ * 之前, 只在 s_state 为 HOME_FOLLOW 时累加)。
  *
- * 为什么要这么做: 卸货区贴着墙, 车越接近家, 墙在画面里占比越大, 蓝墙退避会
- * 在终点前把车推走 (HOME_FOLLOW 做退避, BLACK_AREA_TRACK 不做)。提前交给视觉
- * 就是在墙近到触发退避之前把控制权切走, 从根上避开这个冲突; 顺带里程计漂移
- * 只需要撑到"能看见黑区"那一刻。
- *
- * 为什么还要距离门限: OpenMV 的 BLACK_PIXELS_THRESHOLD 只有 300px (一帧的
- * 0.4%), 阴影、黑胶带、深色底盘都够触发。而误判代价很重 ——
- * BLACK_AREA_TRACK 丢失目标后走 ResumeSearch(), 此时 s_wall_black=1, 会进
- * BLACK_AREA_SEARCH 原地扫视, 整个返航计划就此放弃, 车在半路上开始找黑区。
- * 所以用里程计当粗筛: 只有它认为已经离家不远时才允许交接。里程计不负责精确
- * 定位, 漂移只影响门限松紧, 不影响能否交接。
- *
- * CONFIRM_MS 要求连续这么久都看见, 滤掉单帧闪跳; 被蓝墙退避打断时计时清零
- * (累加逻辑在 switch 之前, 只在 s_state 为 HOME_FOLLOW 时累加)。
+ * 这里没有距离门限: 虽然返航有位置估计, 但里程计误差正是要靠视觉消掉的东西,
+ * 用它去给视觉设门限就本末倒置了。代价是误检风险全靠 OpenMV 侧
+ * 把关: BLACK_PIXELS_THRESHOLD 只有 300px (一帧的 0.4%), 阴影、黑胶带、深色
+ * 底盘都够触发, 而误判代价不轻 (BLACK_AREA_TRACK 丢目标后会转去
+ * BLACK_AREA_SEARCH, 返航航线就此中断)。若实测有远处误触发, 优先调高
+ * OpenMV 的 BLACK_PIXELS_THRESHOLD, 而不是在这里加门限。
  */
-#define HOME_VISION_HANDOVER_CM          150.0f
 #define HOME_VISION_CONFIRM_MS           300U
 #define HOME_RETURN_SPEED_CM_S           23.0f  /* 20.0 */
 #define HOME_RETURN_HEADING_KP           1.2f
 #define HOME_RETURN_MAX_ANGULAR_RAD_S    0.8f
-#define HOME_ROTATE_IN_PLACE_DEG         25.0f  /* 过大易先原地转而不前进 */
-/* 退出原地转所需的更小误差，制造迟滞，避免在阈值上反复切换导致画龙。 */
-#define HOME_ROTATE_EXIT_DEG             12.0f
-/* 原地转按比例限速，但不低于此值，否则小误差时转不动。 */
-#define HOME_ROTATE_MIN_ANGULAR_RAD_S    0.25f
-#define HOME_HEADING_OFFSET_DEG          0.0f  /* 固定偏差补偿，偏右45°可试±45 */
+/*
+ * 直线段的"先转再走"判据: 与锁定方位角的偏差超过这个角度就原地转, 不带前进
+ * 分量; 进到一半 (本值的 0.5 倍) 才切回边走边修, 这个迟滞是必须的 ——
+ * 单阈值会让车在阈值附近反复"停下原地转 / 起步前进", 走不动路。
+ * 别调太大: 25° 已经够, 再大就变成动不动先原地转一圈才肯走。
+ */
+#define HOME_ROTATE_IN_PLACE_DEG         25.0f
+/* 里程计航向的固定偏差补偿: 作用于 x/y 积分, 因而也间接影响由 (x,y) 算出的
+ * 返航方位角。hdg_deg 遥测不经过它 (直接取融合航向相对归零点的转角), 所以调
+ * 它不会改变 hdg_deg 读数, 但会让 home_x/home_y 与 bear_deg 一起转过去。
+ * 只有在确认车实际走的方向与航向读数存在固定夹角时才动它。 */
+#define HOME_HEADING_OFFSET_DEG          0.0f
+/* 卸货前的原地掉头, 融合航向闭环 (不是按时间开环)。
+ * 转不够 180° 车尾就没对准黑区, 物块会卸到区外, 所以停角精度要紧:
+ * 由 FUSION_YAW_SCALE 与下面的 TOL 共同决定, 用蓝牙 ROTATE180 在地面验证。 */
 #define HOME_TURN_AROUND_TARGET_DEG      180.0f
 #define HOME_TURN_AROUND_SPEED_DEG_S     45.0f
 #define HOME_TURN_AROUND_TOL_DEG         5.0f
@@ -245,7 +279,9 @@ typedef struct {
 #define HOME_BACKUP_DURATION_MS          3000U
 #define HOME_BACKUP_SPEED_CM_S           17.25f /* 15.0 */
 
-/* 蓝牙 ROTATE180 / ROTATE360：以IMU融合航向闭环的顺时针原地定角旋转。 */
+/* 蓝牙 ROTATE180 / ROTATE360: 融合航向闭环的顺时针原地定角旋转。
+ * 与 HOME_TURN_AROUND 同一套判据同一个航向源, 所以可以拿它当返航掉头的
+ * 地面验证手段: ROTATE180 转得准, AUTO 里的卸货掉头就准。 */
 #define BT_ROTATE180_TARGET_DEG          180.0f
 #define BT_ROTATE360_TARGET_DEG          360.0f
 #define BT_ROTATE_SPEED_DEG_S            45.0f
@@ -338,8 +374,13 @@ typedef struct {
  *   动作是"后退 + 右转", 退到 OpenMV 不再报有墙为止。
  *   在所有"朝未知方向前进"的状态生效: ROTATE_SEARCH / SEARCH_RELOCATE /
  *   HOME_FOLLOW / BLACK_AREA_SEARCH。
- *   退避结束后一般回被打断的那个状态, 但 SEARCH_RELOCATE 例外: 那个方向既然
- *   被墙拦住, 就不回去重走剩下的距离, 直接回原地扫视重新挑方向。
+ *   退避结束后的去向分三种:
+ *     SEARCH_RELOCATE  → 不回去重走剩下的距离, 那个方向既然被墙拦住, 直接回
+ *                        原地扫视重新挑方向;
+ *     HOME_FOLLOW      → 倒一小段并把锁定的返航方位角右旋 8°, 回 HOME_FOLLOW
+ *                        沿新方位角继续往前拱, 墙还在就再来一档
+ *                        (见下面的 HOME_BACKOFF_*);
+ *     其余             → 回被打断的那个状态。
  *   物块与黑区的最后接近段必须禁用: 前者要撞上去推进滚刷
  *   (COLLECT_DISTANCE_CM 只有 10cm), 后者要压到黑区上方才卸货。
  *   CLEAR_MS 要求连续这么久无墙才退出, 否则蓝墙在视野边缘闪烁时会
@@ -351,30 +392,45 @@ typedef struct {
 #define WALL_BACKOFF_TIMEOUT_MS          6000U
 /*
  * 返航直线段 (HOME_FOLLOW) 专用的定量退避, 与上面的通用退避两点不同:
- *   1) 退出条件是"走完 HOME_BACKOFF_DURATION_MS", 不等墙从视野里消失 ——
+ *   1) 退出条件是"倒完 HOME_BACKOFF_DURATION_MS", 不等墙从视野里消失 ——
  *      返航要的是绕过去继续走, 不是原地磨到墙不见;
- *   2) 退完把锁定的返航方位角一起右旋 HOME_BACKOFF_TURN_DEG, 车才真的走上
- *      新航线; 只转车不转方位角的话, 下一周期就被拧回原方位角撞回同一面墙。
- * 一次偏 30°, 偏完继续走; 墙还在就再触发一次, 形成 30° 一档的绕行 ——
- * 三次偏到 90° (沿墙方向), 单个循环约 1.8s, 在 10s 累计预算内够绕出去, 又比
- * 45° 温和, 单次偏离航线没那么狠。
- * 速度沿用 WALL_BACKOFF_SPEED_CM_S (17.25cm/s), 0.8s 约后退 14cm;
- * 摊出来的转速 37.5°/s 对应回转半径约 26cm, 左右轮速差约 7cm/s。
- * 若实测倒车弧线打滑、实际偏角不足, 优先加长 HOME_BACKOFF_DURATION_MS 把转速
- * 摊低, 而不是减小角度。
- * 累计兜底仍是 WALL_STRUGGLE_TIMEOUT_MS: 10s 内绕不出去就放弃剩下的返航
- * 距离, 就地转 BLACK_AREA_SEARCH 用视觉找黑区。
+ *   2) 退完把锁定的返航方位角一起右旋 HOME_BACKOFF_TURN_DEG, 车才真的走上新
+ *      航线。只转车不转方位角的话, 回到 HOME_FOLLOW 第一个周期就按原方位角
+ *      左转拧回来, 又撞上同一面墙。
+ * 一次只偏 8°, 偏完继续往前拱; 墙还在就再触发一次, 8° 一档地蹭出去。整个过程
+ * 里 OpenMV 一直是黑区模式, 看见黑区随时转 BLACK_AREA_TRACK 走后续流程。
+ * 17.25cm/s × 0.8s ≈ 后退 14cm。
+ * 为什么偏这么小: 大角度一档就把车头甩离原航线, 走完 3/4 的落点偏差大; 8° 是
+ * "尽量不偏离回家方向"和"能绕开墙"之间的折中, 代价是绕一面正面墙要十来档。
+ * 累计兜底改用 HOME_WALL_GIVEUP_MS, 不是 WALL_STRUGGLE_TIMEOUT_MS, 原因见下。
  */
 #define HOME_BACKOFF_DURATION_MS         800U
-#define HOME_BACKOFF_TURN_DEG            30.0f  /* 10.0 → 45.0 */
-/* 摊到整段上的转速; 改上面两个值时自动跟随。调用处取负 = 右转 (顺时针)。 */
+#define HOME_BACKOFF_TURN_DEG            8.0f   /* 30 / 45 / 10 */
+/* 摊到整段退避上的转速; 改上面两个值时自动跟随。调用处取负 = 右转 (顺时针)。 */
 #define HOME_BACKOFF_TURN_DEG_S \
-  (HOME_BACKOFF_TURN_DEG * 1000.0f / (float)HOME_BACKOFF_DURATION_MS)
+  (HOME_BACKOFF_TURN_DEG / (HOME_BACKOFF_DURATION_MS / 1000.0f))
+/*
+ * 返航段专用的贴墙放弃预算, 顶替 WALL_STRUGGLE_TIMEOUT_MS。
+ *
+ * 为什么不能沿用那 10s: 那个数是配 30°/档定的, 三四档就绕开了。现在一档只偏
+ * 8°, 正面撞墙要偏出去得十来档; 而计时把"退避 0.8s + 退完往前拱的那一下"整个
+ * 算进去, 一档实际吃掉 1.5~2s, 10s 只够攒 40° 左右 —— 车还顶在墙上就被判成
+ * 卡死, 8° 一档的绕行根本走不完。
+ *
+ * 这个兜底不能省: 一直 8° 转下去总会转到背离家的方向, 那时"走完 3/4"的正常
+ * 出口永远等不到 (离原点的距离不减反增), 没有它车会顺着新方位角一路开走。
+ * 30s 按上面的节奏够偏 120° 以上, 正面墙和场地角都够用。到点就放弃剩下的
+ * 返航距离, 就地转 BLACK_AREA_SEARCH 原地扫黑区。
+ */
+#define HOME_WALL_GIVEUP_MS              30000U
 /*
  * 贴墙纠缠兜底: 从第一次看见墙起累加, 跨越"退避 <-> 原状态"的往返不清零。
  * 各状态自己的超时用 s_state_ms, 而退避进出各调一次 Enter() 都会把它清零,
  * 所以车沿着墙走、每隔十几秒触发一次退避时, 那些超时永远攒不满。到点后由
  * 宿主状态执行自己的兜底跳转 (换位 / 转黑区搜索), 保证状态机往前走。
+ * 只管搜索类状态 (ROTATE_SEARCH / SEARCH_RELOCATE / BLACK_AREA_SEARCH);
+ * 返航段用的是 HOME_WALL_GIVEUP_MS, 那边一档只偏 8°, 需要宽裕得多的预算。
+ * 计时器本身是同一个 (s_wall_struggle_ms), 只是判据阈值不同。
  */
 #define WALL_STRUGGLE_TIMEOUT_MS         10000U
 
@@ -481,19 +537,56 @@ typedef struct {
 #define FUSION_COMP_GAMMA                0.5f
 /* IMU 航向符号 (校准用): 若融合航向往反方向跑, 改为 -1.0f */
 #define FUSION_IMU_YAW_SIGN              1.0f
-/* 航向标度校准 (校准用): 融合航向相对"归零点"的增量整体乘以该系数。
+/* 航向标度校准: 融合航向相对"归零点"的增量整体乘以该系数。
  *
- *   现象: 下 ROTATE180 实际只转 150°, 下 ROTATE360 实际只转 315°
- *         → 说明估计出的转角比真实转角偏大, 车提前认为转够了就停。
- *   标定: FUSION_YAW_SCALE = 实测真实转角 / 指令角度
- *         180 命令实测 150 → 150/180 = 0.833
- *         360 命令实测 315 → 315/360 = 0.875
- *         取两者中值 0.85 起步, 再按下式迭代一两轮即可收敛:
- *           新值 = 当前值 × (实测转角 / 指令角度)
- *   影响面: 航向是 home_x/home_y 与返航方位角的唯一角度来源, 所以这一个
- *           系数同时修正 ROTATE 指令精度、里程计定位和回家直线段方向。
- *   注意: 只缩放"增量", 不动归零基准, 所以 SET_HOME 后的绝对参考不变。 */
+ *   由来: 下 ROTATE180 实际只转 150°, ROTATE360 实际只转 315° —— 估计出的
+ *         转角比真实转角偏大, 车提前认为转够了就停。根因是原地旋转时 4 轮
+ *         打滑, 编码器推算的转角虚高, 把融合航向拽了上去。
+ *         标定式: 新值 = 当前值 × (实测转角 / 指令角度)。
+ *
+ *   >>> 这是全车唯一影响转角精度的系数 <<<
+ *   曾经把定角旋转和返航链路挪去一条纯 IMU 航向 (见 IMU_YAW_SCALE), 想绕开
+ *   编码器打滑; 实测更差, 已全部撤回。现在吃这个系数的有:
+ *     · 蓝牙 ROTATE180 / ROTATE360
+ *     · 返航链路: HOME_FOLLOW 朝方位角保向、HOME_TURN_AROUND 掉头
+ *     · SEARCH_RELOCATE 的转向瞄准、扫视方向表
+ *     · home_x / home_y 位置积分与 hdg_deg / bear_deg 遥测
+ *
+ *   标定注意: 0.85 是在 BT_ROTATE_TOL_DEG=3 时定的, 与当前值一致, 所以那次
+ *   标定仍然有效。若改了容差再重标, 容差必须一起算进去:
+ *     新值 = 当前值 × (实测/指令) × (指令-旧容差)/(指令-新容差)
+ *
+ *   注意: 只缩放"增量", 不动归零基准, 所以 SET_HOME 后的绝对参考不变。
+ *   返航直线段追的方位角本身也在这个缩放过的航向系里, 与航向同源, 所以本
+ *   系数对"能不能对准家"的影响会部分抵消; 它主要还是决定定角旋转的精度。 */
 #define FUSION_YAW_SCALE                 0.85f
+/* 纯 IMU 航向 (SensorFusion_GetImuHeading) 的标度校准。
+ *
+ *   >>> 现在不参与任何控制, 只作用于遥测的 imu_yaw 字段 <<<
+ *   这一路是为了绕开原地旋转时的四轮打滑而单独拉出来的, 定角旋转和返航链路
+ *   都曾走它, 实测不如融合航向, 已全部改回 FUSION_YAW_SCALE 那一路。
+ *
+ *   保持 1.0 (不校准) 是刻意的: 遥测里要看的就是模组的原始表现, 乘了系数就
+ *   没法拿它和 yaw_enc / hdg_deg 对照定位问题了。
+ *
+ *   实测记录 (模组是 6 轴, yaw 为纯陀螺积分, 无磁力计):
+ *     0.833 + tol 3 → 180 指令实测约 175°   → k = 175 / (177/0.833) = 0.824
+ *     0.819 + tol 1 → 180 指令实测约 185°   → k = 185 / (179/0.819) = 0.846
+ *     0.826 + tol 1 → 180 指令基本准        → k = 180 / (179/0.826) = 0.831
+ *   k = 实测/模组原始估计, 三次落在 ±1.3% 内 (±2.4°, 在肉眼量角误差内), 即
+ *   一个干净的比例误差: 模组 yaw 把转角多报约 20%。
+ *   注: 早期那组"180 实测 150 / 360 实测 315"是融合航向通路的数据 (纯 IMU
+ *   通路当时还不存在), 不能和上面三行混在一起拟合, 否则会拟出一个假的固定项。
+ *
+ *   为什么单独标定过还是不好用: 20% 这个量级远超陀螺器件指标, 基本只能是
+ *   振动整流 (模组硬连底盘, 四轮搓地的振动被整流成直流偏置), 因此该比例随
+ *   转速和负载变化 —— 旁证是"外部施加阻力时偏差变大"。而 0.826 是在
+ *   BT_ROTATE_SPEED_DEG_S=45 标的, 全场累计转角最多的 ROTATE_SEARCH 跑的是
+ *   SEARCH_ROTATION_SPEED_DEG_S=30, 用错档的系数, 加上搜索恒为顺时针, 同号
+ *   残差在一轮里能叠到上百度, 返航对准初始方向就废了。
+ *   要救这一路得先做机械隔振 (泡棉/橡胶浮装模组), 把 k 拉回 0.98 附近再谈
+ *   标定; 光调系数追不上。 */
+#define IMU_YAW_SCALE                    1.0f
 /* 卡尔曼噪声参数 (方差, 越大越不信任该源) */
 #define FUSION_KF_Q_ACCEL                0.01f
 #define FUSION_KF_R_ENC_RAD              0.02f

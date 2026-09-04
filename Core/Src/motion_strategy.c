@@ -18,12 +18,12 @@ static uint8_t s_wall_black;
 static uint8_t s_action_step;
 static float s_scan_heading;
 static float s_move_cm;
-static float s_move_target_cm;
 static float s_prev_target[WHEEL_COUNT];
 static float s_rotate_start_heading;
 static float s_rotate_target_deg;
-static uint8_t s_bt_return;
 static uint8_t s_task_complete;
+/* 返航直线段的退出阈值: 距原点还剩这么多就收手, 见 HOME_PARTIAL_RETURN_RATIO。 */
+static float s_move_target_cm;
 /* 蓝墙退避: 记住被打断的状态，退开后原样恢复，不影响任务进度。 */
 static MotionState_t s_backoff_return_state;
 /* 蓝墙退避: 连续无墙时长，用于退出判据的去抖。 */
@@ -220,9 +220,9 @@ static uint8_t WallStruggleTimeout(void)
 }
 
 /*
- * 久搜无果返航，每一轮都生效 (包括第一轮)。
- * 代价是第一轮若因视觉链路故障搜不到物块，车会带着空斗返航跑完剩下的流程；
- * 换来的是任何一轮都不会卡在原地搜索里耗完全场时间。
+ * 距上次收集成功已超预算，放弃本轮返航；每一轮都生效 (包括第一轮)。
+ * 代价是第一轮若因视觉链路故障收不到物块，车会带着空斗返航跑完剩下的流程；
+ * 换来的是任何一轮都不会卡在搜索或反复对准里耗完全场时间。
  */
 static uint8_t SearchGiveUp(void)
 {
@@ -327,11 +327,11 @@ void MotionStrategy_Init(void)
   s_black_target = 0U;
   s_action_step = 0U;
   s_scan_heading = 0.0f;
-  s_move_cm = s_move_target_cm = 0.0f;
+  s_move_cm = 0.0f;
   s_rotate_start_heading = 0.0f;
   s_rotate_target_deg = 0.0f;
-  s_bt_return = 0U;
   s_task_complete = 0U;
+  s_move_target_cm = 0.0f;
   s_backoff_return_state = MOTION_STATE_ROTATE_SEARCH;
   s_wall_clear_ms = 0U;
   s_arrive_confirm_ms = 0U;
@@ -352,7 +352,6 @@ void MotionStrategy_Stop(void)
   s_state = MOTION_STATE_STANDBY;
   s_state_ms = 0U;
   s_action_step = 0U;
-  s_bt_return = 0U;
   s_missing_ms = 0U;
   s_wall_struggle_ms = 0U;
   s_wall_struggle_active = 0U;
@@ -360,16 +359,6 @@ void MotionStrategy_Stop(void)
   s_home_seen_ms = 0U;
   s_relocate_valid = 0U;
   s_scan_table_valid = 0U;
-}
-
-void MotionStrategy_RequestReturn(void)
-{
-  if (!ImuOdometry_IsOriginSet()) {
-    ImuOdometry_SetHome();
-  }
-  s_task_complete = 0U;
-  s_bt_return = 1U;
-  Enter(MOTION_STATE_HOME_PREPARE);
 }
 
 void MotionStrategy_RequestRotateCw(float target_deg)
@@ -408,6 +397,13 @@ void MotionStrategy_Update(const VisionData_t *vision,
   out->detect_black_area = s_black_target;
 
   ImuOdometry_Update(wheels, dt);
+  /*
+   * 全车只有这一个航向来源: 融合航向 (编码器 + IMU, 见 sensor_fusion)。
+   * 曾经给定角机动 (蓝牙定角旋转、返航对准/直行/掉头) 单独走过一条纯 IMU
+   * 航向, 想绕开原地旋转时的四轮打滑; 实测纯 IMU 更差 —— 模组 yaw 多报约
+   * 20%, 且该比例随转速/负载变化, 一轮全场下来累积误差比打滑还大, 故撤回。
+   * 纯 IMU 航向现在只留在遥测里 (ImuOdometry_GetImuYawDeg) 用于对比诊断。
+   */
   heading = ImuOdometry_GetHeadingRad();
   s_state_ms += elapsed_ms;
   if (s_wall_struggle_active) s_wall_struggle_ms += elapsed_ms;
@@ -418,29 +414,33 @@ void MotionStrategy_Update(const VisionData_t *vision,
   else s_missing_ms += elapsed_ms;
 
   /*
-   * 找物块阶段的累计计时。只有看见物块才清零，ROTATE_SEARCH 与
-   * SEARCH_RELOCATE 之间来回跳、被蓝墙退避打断都持续累加——这正是它不能用
-   * s_state_ms 的原因，那个每次 Enter() 都被冲掉。
-   * 黑区阶段(s_black_target)不计时：那时找的是卸货区，不是物块。
+   * 距上次滚刷收集成功的时长，见 motion_config.h §7 SEARCH_GIVE_UP_MS。
+   * 只在 BRUSH_COLLECT 走完整套动作、s_collected 真的加一时才清零——衡量的
+   * 是"有没有真的收到物块"，不是"有没有看见物块"。看见就清零的话，车反复
+   * 盯着一个够不到的物块、或者每次追踪都在最后丢失，计时会被无限推迟。
+   * 收集阶段全程累加，所以卡在 PRE_CENTERING/TARGET_TRACKING 的往复里也会
+   * 到点，不像只在搜索态计时那样漏掉这类卡死。
+   * 三个例外不计时: 黑区/返航阶段(s_black_target)找的是卸货区不是物块;
+   * STANDBY 与 BT_ROTATE 是手动/蓝牙态, 在那停多久都不该算进任务预算;
+   * INIT 只过一个周期, 顺带排除。
    */
-  if (s_black_target || wanted_detected) {
+  if (s_black_target) {
     s_search_ms = 0U;
-  } else if (s_state == MOTION_STATE_ROTATE_SEARCH ||
-             s_state == MOTION_STATE_SEARCH_RELOCATE ||
-             s_state == MOTION_STATE_WALL_BACKOFF) {
+  } else if (s_state != MOTION_STATE_INIT &&
+             s_state != MOTION_STATE_STANDBY &&
+             s_state != MOTION_STATE_BT_ROTATE) {
     s_search_ms += elapsed_ms;
   }
 
   /*
-   * 返航途中的视觉交接确认。放在 switch 之前而不是 HOME_FOLLOW 里面，是为了
-   * 让"被蓝墙退避打断"自动等价于"连续性中断"：退避期间 s_state 不是
-   * HOME_FOLLOW，走 else 分支清零，不必再往 Enter() 里加一条特例。
-   * 距离门限用里程计当粗筛，防止远处的暗斑抢走控制权，理由见
-   * motion_config.h 里 HOME_VISION_HANDOVER_CM 的说明。
+   * 返航途中的视觉交接确认。放在 switch 之前而不是各状态里面，是为了让
+   * "被蓝墙退避打断"自动等价于"连续性中断"：退避期间 s_state 是
+   * WALL_BACKOFF，走 else 分支清零，不必再往 Enter() 里加特例。
+   * 没有距离门限，误检全靠 OpenMV 的 BLACK_PIXELS_THRESHOLD 把关，
+   * 见 motion_config.h 里 HOME_VISION_CONFIRM_MS 的说明。
    */
-  if (s_state == MOTION_STATE_HOME_FOLLOW && s_black_target &&
-      wanted_detected &&
-      ImuOdometry_GetDistanceCm() <= HOME_VISION_HANDOVER_CM) {
+  if (s_state == MOTION_STATE_HOME_FOLLOW &&
+      s_black_target && wanted_detected) {
     s_home_seen_ms += elapsed_ms;
   } else {
     s_home_seen_ms = 0U;
@@ -470,9 +470,8 @@ void MotionStrategy_Update(const VisionData_t *vision,
        * 从视野里消失——返航要的是绕过去继续走，不是原地磨到墙不见。
        * 退完必须把锁定的返航方位角一起右旋同样角度，否则回到 HOME_FOLLOW
        * 第一个周期就按原方位角左转拧回来，又撞上同一面墙。
-       * 墙还在就再触发一次，形成 30° 一档的绕行——三次偏到沿墙方向，能在
-       * 10s 累计预算内绕出去；累计超时后由 HOME_FOLLOW 里的
-       * WallStruggleTimeout() 放弃返航转去找黑区。
+       * 墙还在就再触发一次，自然形成一档一档的绕行；累计绕不出去时由
+       * HOME_FOLLOW 里的 WallStruggleTimeout() 放弃返航转去找黑区。
        */
       if (s_state_ms >= HOME_BACKOFF_DURATION_MS) {
         Motion_StopOutput(out);
@@ -532,6 +531,7 @@ void MotionStrategy_Update(const VisionData_t *vision,
         break;
       }
       ImuOdometry_SetHome();
+      /* SetHome 会重置航向, 要重取, 别把复位前的值带进本周期。 */
       heading = ImuOdometry_GetHeadingRad();
     }
     s_black_target = 0U;
@@ -543,7 +543,7 @@ void MotionStrategy_Update(const VisionData_t *vision,
   }
 
   case MOTION_STATE_ROTATE_SEARCH:
-    /* 收满，或久搜无果(场上已经没有能收的物块了)，都转返航。 */
+    /* 收满，或距上次收集成功已超预算(收不动了)，都转返航。 */
     if (s_collected >= TOTAL_OBJECTS_TO_COLLECT || SearchGiveUp()) {
       Enter(MOTION_STATE_HOME_PREPARE);
       break;
@@ -606,7 +606,7 @@ void MotionStrategy_Update(const VisionData_t *vision,
     if (wanted_detected) {
       Enter(MOTION_STATE_PRE_CENTERING);
     } else if (SearchGiveUp()) {
-      /* 换位途中到点也立刻返航，不必等走完这 60cm。 */
+      /* 换位途中到点也立刻返航，不必等走完 SEARCH_RELOCATE_DIST_CM。 */
       Motion_StopOutput(out);
       Enter(MOTION_STATE_HOME_PREPARE);
     } else if (BackoffIfWallSeen(vwall, out)) {
@@ -744,6 +744,9 @@ void MotionStrategy_Update(const VisionData_t *vision,
     } else if (s_action_step == 5U &&
                !ActuatorServos_IsBusy(ACTUATOR_SERVO_BUCKET)) {
       s_collected++;
+      /* 唯一的清零点：整套滚刷+后斗动作走完才算一次真实进度。下面的超时
+       * 分支不清零，那条路没收到东西。 */
+      s_search_ms = 0U;
       Enter(MOTION_STATE_SEARCH_CONTINUE);
     }
     if (s_state_ms >= BRUSH_TIMEOUT_MS + BUCKET_OUTBOUND_MS +
@@ -760,55 +763,65 @@ void MotionStrategy_Update(const VisionData_t *vision,
     break;
 
   case MOTION_STATE_HOME_PREPARE:
+    /*
+     * 返航起步：锁定此刻朝向原点的方位角，并按当前距离算出直线段的终点。
+     * 只走全程的 HOME_PARTIAL_RETURN_RATIO，把"剩下多少距离"存进
+     * s_move_target_cm 当退出阈值；余下的路交给视觉找黑区，用它消掉里程计
+     * 的累计误差。
+     */
     Motion_StopOutput(out);
     ImuOdometry_BeginReturn();
-    /* 直线段只跑全程的 HOME_PARTIAL_RETURN_RATIO，剩余距离作为退出阈值。 */
     s_move_target_cm = ImuOdometry_GetDistanceCm() *
                        (1.0f - HOME_PARTIAL_RETURN_RATIO);
-    if (!s_bt_return) {
-      /* 直线段就让OpenMV切黑区模式，到位时视觉已经稳定输出。 */
-      s_black_target = 1U;
-      s_wall_black = 1U;
-    }
+    /* 返航全程让 OpenMV 处于黑区模式，看见就能随时交接。 */
+    s_black_target = 1U;
+    s_wall_black = 1U;
     Enter(MOTION_STATE_HOME_FOLLOW);
     break;
 
   case MOTION_STATE_HOME_FOLLOW: {
-    float return_linear;
-    float return_angular;
-    uint8_t arrived = ImuOdometry_GetReturnCommand(&return_linear,
-                                                   &return_angular);
     /*
-     * 视觉交接优先于里程计的距离判据：确认看见黑区就直接追踪，比先走到 3/4
-     * 再原地扫视找它省一整个 BLACK_AREA_SEARCH 阶段，也避开了终点前被蓝墙
-     * 退避推走的问题（本状态做退避，BLACK_AREA_TRACK 不做）。
-     * 此刻 wanted_detected 必为真，所以 s_missing_ms 已是 0，无需再清。
+     * 朝锁定的方位角直行，偏差大时先原地转（迟滞判据都在
+     * HomeTrajectory_GetReturnCommand 里）。全程盯着黑区。出路：
+     *   确认看见黑区                → 交给 BLACK_AREA_TRACK；
+     *   走完 3/4 或已进到 12cm 内   → BLACK_AREA_SEARCH 原地扫视；
+     *   撞墙                        → 退一小段 + 方位角右旋 8°，回本状态继续
+     *                                 往前拱；墙还在就再来一档，如此反复；
+     *   贴墙累计到点 / 兜底超时     → BLACK_AREA_SEARCH。
      */
+    float linear = 0.0f;
+    float angular = 0.0f;
+    uint8_t arrived = ImuOdometry_GetReturnCommand(heading, &linear, &angular);
+
     if (s_home_seen_ms >= HOME_VISION_CONFIRM_MS) {
+      /* 计时能攒满就说明这一刻 wanted_detected 为真，s_missing_ms 已是 0。 */
       Motion_StopOutput(out);
       Enter(MOTION_STATE_BLACK_AREA_TRACK);
     } else if (arrived ||
-        ImuOdometry_GetDistanceCm() <= s_move_target_cm ||
-        s_state_ms >= HOME_FOLLOW_TIMEOUT_MS ||
-        WallStruggleTimeout()) {
+               ImuOdometry_GetDistanceCm() <= s_move_target_cm ||
+               s_state_ms >= HOME_FOLLOW_TIMEOUT_MS ||
+               (s_wall_struggle_active &&
+                s_wall_struggle_ms >= HOME_WALL_GIVEUP_MS)) {
+      /*
+       * 直线段到此为止。贴墙计时用返航自己的 HOME_WALL_GIVEUP_MS 而不是
+       * WallStruggleTimeout()：后者的 10s 是配大角度退避定的，8° 一档绕不完
+       * 就会被判成卡死。到点表示一直贴着墙绕不出去，剩下的返航距离不要了，
+       * 就地找黑区；s_wall_black 在 HOME_PREPARE 已置 1，BLACK_AREA_SEARCH
+       * 后续的换位/重扫都会留在黑区这条线上。
+       */
       Motion_StopOutput(out);
-      s_missing_ms = 0U;
-      if (s_bt_return) {
-        /* 蓝牙 RETURN 只负责直线段，到位后交还手动待机。 */
-        s_bt_return = 0U;
-        s_task_complete = 1U;
-        Enter(MOTION_STATE_STANDBY);
-      } else {
-        /* AUTO: 直线段结束改由视觉找黑色卸货区，消除里程计累计误差。 */
-        Enter(MOTION_STATE_BLACK_AREA_SEARCH);
-      }
-    } else if (!BackoffIfWallSeen(vwall, out)) {
-      Motion_Drive(return_linear, return_angular, out);
+      Enter(MOTION_STATE_BLACK_AREA_SEARCH);
+    } else if (BackoffIfWallSeen(vwall, out)) {
+      /* 已转入退避，本周期不再输出其他动作。 */
+    } else {
+      Motion_Drive(linear, angular, out);
     }
     break;
   }
 
   case MOTION_STATE_HOME_TURN_AROUND:
+    /* 融合航向闭环, 不是定时开环: 轮子打滑/空转时按时间转会差得更远。
+     * 停角精度由 FUSION_YAW_SCALE 和 HOME_TURN_AROUND_TOL_DEG 共同决定。 */
     if (RotateCwStep(heading, HOME_TURN_AROUND_SPEED_DEG_S,
                      HOME_TURN_AROUND_TOL_DEG,
                      HOME_TURN_AROUND_TIMEOUT_MS, out)) {
@@ -900,11 +913,11 @@ void MotionStrategy_Update(const VisionData_t *vision,
         if (s_unload_cycles == 1U) {
           /*
            * 第二次卸货的落脚点定为下一轮的(0,0)：这里离真实卸货点最近。
-           * SetHome() 内部会把 x/y 和返航锁定一并清零，所以不必再调
-           * ImuOdometry_Init()——那还会连带重置融合滤波器，白丢已经收敛
-           * 的陀螺零偏。此刻车已停稳，航向归零不会打断任何旋转动作。
+           * 用 MoveOriginHere() 而不是 SetHome()：后者会把融合航向清零，
+           * 而返航靠开机锁存的绝对航向定方向，中途清一次航向基准就失效了。
+           * 位置清零本身只影响 home_x/home_y 遥测，不参与返航决策。
            */
-          ImuOdometry_SetHome();
+          ImuOdometry_MoveOriginHere();
         }
         s_action_step = 2U;
       } else {

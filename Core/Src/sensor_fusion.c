@@ -34,9 +34,12 @@
  *   绝对修正: θ_corr = θ_enc + γ·wrap(θ_imu - θ_enc)  (IMU 与编码器按 γ 混合)
  *   融合: θ = θ_pred + (1-α)·wrap(θ_corr - θ_pred)  (预测为主, 绝对源长期拉回)
  *
- *   对外出口统一做标度校准 (FUSION_YAW_SCALE): 滤波器内部保持原始航向空间,
- *   只把"相对归零点的增量"按系数缩放后发布, 用一个系数同时修正定角旋转、
- *   里程计 (x,y) 和返航方位角。
+ *   对外出口做标度校准: 滤波器内部保持原始航向空间, 只把"相对归零点的增量"
+ *   按系数缩放后发布。两个出口用两个系数 ——
+ *     GetHeading    (融合航向) 过 FUSION_YAW_SCALE。全车的角度控制都吃这一路:
+ *                   定角旋转、返航对准/直行/掉头、里程计 (x,y) 与遥测。
+ *     GetImuHeading (纯 IMU 航向) 过 IMU_YAW_SCALE。曾用于定角旋转以绕开编码
+ *                   器打滑, 实测更差已撤回, 现在只剩遥测诊断。
  */
 #include "sensor_fusion.h"
 #include "imu_processor.h"
@@ -63,6 +66,15 @@ static float s_comp_theta = 0.0f;      /* 上周期融合航向 */
  *   滤波器内部一律用原始量, 只在对外出口缩放, 避免污染 IMU 绝对参考。 */
 static float s_yaw_ref   = 0.0f;       /* 上次归零时的原始航向 (缩放基准) */
 static float s_theta_raw = 0.0f;       /* 未缩放的融合航向 */
+
+/* 纯 IMU 航向 (仅遥测诊断用, 见 SensorFusion_GetImuHeading)
+ *   JY901S 的 yaw 寄存器在 ±180° 回绕, 这里按周期差分展开成单调累加量,
+ *   好让"起始航向 - 当前航向"这种判据能跨过 ±180° 边界。
+ *   不参与滤波, 不过 FUSION_YAW_SCALE (那个是补编码器打滑的), 只过自己的
+ *   IMU_YAW_SCALE (默认 1.0, 即原样输出)。 */
+static float s_imu_heading = 0.0f;     /* 展开后的纯 IMU 航向 (rad) */
+static float s_imu_src_prev = 0.0f;    /* 上周期的增量来源读数 */
+static uint8_t s_imu_src_alive = 0U;   /* 上周期用的是 IMU 还是编码器 */
 
 /* 直线速度 */
 static float s_lin_vel_cms = 0.0f;     /* 当前融合速度 */
@@ -258,6 +270,9 @@ void SensorFusion_Init(void)
     s_comp_theta  = 0.0f;
     s_yaw_ref     = 0.0f;
     s_theta_raw   = 0.0f;
+    s_imu_heading   = 0.0f;
+    s_imu_src_prev  = 0.0f;
+    s_imu_src_alive = 0U;
     s_lin_vel_cms = 0.0f;
     s_lin_vel_prev = 0.0f;
 
@@ -365,6 +380,27 @@ void SensorFusion_Update(const WheelFeedback_t *wheels, float dt)
     s_lin_vel_prev = v_out;
     s_lin_vel_cms  = v_out;
 
+    /*
+     * ⑥' 纯 IMU 航向展开。
+     *   IMU 在线时取 yaw 寄存器的增量 (要 WrapToPi, 它在 ±180° 回绕);
+     *   离线时退化成取编码器航向的增量 (本身单调, 不用 wrap), 这样断线时
+     *   曲线是平滑接续而不是跳变 —— 两个源的绝对参考不同, 所以只能取增量。
+     *   切换源的那一周期先对齐 prev, 否则会算出一个跨源的假增量。
+     */
+    {
+        const float src = imu_alive ? theta_imu : s_enc_heading;
+        if (imu_alive != s_imu_src_alive) {
+            s_imu_src_prev  = src;
+            s_imu_src_alive = imu_alive;
+        }
+        /* 两个源各用自己的标度系数: IMU 段用 IMU_YAW_SCALE, 降级到编码器的
+         * 段沿用 FUSION_YAW_SCALE (编码器打滑那一项本来就是它标定的)。 */
+        s_imu_heading += imu_alive
+          ? WrapToPi(src - s_imu_src_prev) * IMU_YAW_SCALE
+          : (src - s_imu_src_prev) * FUSION_YAW_SCALE;
+        s_imu_src_prev = src;
+    }
+
     /* ⑥ 刷新对外状态 (航向/角速度过标度校准, 见 FUSION_YAW_SCALE) */
     s_theta_raw             = theta_out;
     s_state.heading_rad     = s_yaw_ref +
@@ -397,6 +433,16 @@ float SensorFusion_GetLinearVelocity(void)
     return s_state.linear_vel_cms;
 }
 
+float SensorFusion_GetImuHeading(void)
+{
+    return s_imu_heading;
+}
+
+float SensorFusion_GetYawRef(void)
+{
+    return s_yaw_ref;
+}
+
 void SensorFusion_ResetHeading(void)
 {
     /* 【帧对齐】 编码器航向从 0 起算, IMU yaw 是绝对角, 两者参考点不同。
@@ -414,6 +460,11 @@ void SensorFusion_ResetHeading(void)
     /* 标度基准跟着归零点走: 之后的缩放只作用于相对该点的增量。 */
     s_yaw_ref           = theta0;
     s_theta_raw         = theta0;
+
+    /* 纯 IMU 航向也对齐到同一归零点, 两个航向出口从此刻起同源同值。 */
+    s_imu_heading       = theta0;
+    s_imu_src_prev      = theta0;
+    s_imu_src_alive     = (IMU_IsAlive() && IMU_IsInitialized()) ? 1U : 0U;
 
     s_enc_heading       = theta0;
     s_enc_heading_prev  = theta0;

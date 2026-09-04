@@ -11,11 +11,19 @@
 void ImuOdometry_Init(void);
 void ImuOdometry_Update(const WheelFeedback_t *wheels, float dt_s);
 
-/* 当前位置设为原点 (0,0)，航向归零。蓝牙 SET_HOME 调用。 */
+/* 当前位置设为原点 (0,0)，航向归零。开机初始化与蓝牙 SET_HOME 调用。
+ * 航向归零会切断绝对航向的连续性，任务途中不要用。 */
 void ImuOdometry_SetHome(void);
+/* 只把 (0,0) 挪到当前位置，不动航向。卸货时标记下一轮原点用。 */
+void ImuOdometry_MoveOriginHere(void);
+
+/* 返航直线段：锁定朝向原点的方位角 → 每周期取指令 → 遇墙退避后右旋一档。
+ * GetReturnCommand 返回 1 表示已进到 HOME_ARRIVAL_RADIUS_CM 内。 */
 void ImuOdometry_BeginReturn(void);
-/* 返航途中绕墙: 车右偏多少, 锁定的返航方位角就跟着偏多少 (负 = 右旋)。 */
 void ImuOdometry_NudgeReturnBearing(float delta_rad);
+uint8_t ImuOdometry_GetReturnCommand(float heading_rad,
+                                     float *linear_cm_s,
+                                     float *angular_rad_s);
 
 uint8_t ImuOdometry_IsOriginSet(void);
 uint8_t ImuOdometry_IsImuAlive(void);
@@ -35,7 +43,6 @@ int16_t ImuOdometry_GetBearingDeg(void);
 int16_t ImuOdometry_GetImuYawDeg(void);
 int16_t ImuOdometry_GetEncHeadingDeg(void);
 
-uint8_t ImuOdometry_GetReturnCommand(float *linear_cm_s, float *angular_rad_s);
 void ImuOdometry_GetFusionState(FusionState_t *out);
 
 #endif

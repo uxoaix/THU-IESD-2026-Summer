@@ -96,6 +96,35 @@ float SensorFusion_GetYawRate(void);
 float SensorFusion_GetLinearVelocity(void);
 
 /**
+ * @brief  取纯 IMU 航向 (rad, 正=CCW, 单调累加不回绕) —— 仅遥测诊断用
+ *
+ *   与 SensorFusion_GetHeading 的区别: 不掺编码器, 不过 FUSION_YAW_SCALE,
+ *   直接把模组 yaw 寄存器的增量展开累加。
+ *
+ *   曾经把定角旋转和返航链路挪到这一路, 想绕开原地旋转时四轮打滑对编码器
+ *   航向的污染。实测反而更差: 模组 yaw 把转角多报约 20%, 且该比例随转速和
+ *   负载变化 (疑似模组硬连底盘导致的振动整流), 单一标度补不平; 搜索旋转恒
+ *   为顺时针, 同号残差在一轮全场里能累积到上百度, 返航对准初始方向就失效。
+ *   故已全部改回融合航向, 这里只保留给遥测做对照。详见 IMU_YAW_SCALE 注释。
+ *
+ *   IMU 断线时内部退化成取编码器航向的增量 (曲线平滑接续, 不跳变)。
+ */
+float SensorFusion_GetImuHeading(void);
+
+/**
+ * @brief  取航向归零基准 (rad) —— 三路航向共用的零点
+ *
+ *   每次 SensorFusion_ResetHeading 都会把融合航向、纯 IMU 航向、编码器航向
+ *   三个累加器一起设成当时的原始 yaw, 并把该值存为归零基准。因此
+ *     GetHeading()     - GetYawRef() = 归零以来的融合转角 (已过 FUSION_YAW_SCALE)
+ *     GetImuHeading()  - GetYawRef() = 归零以来的纯 IMU 转角 (未校准)
+ *     GetState().heading_enc_rad - GetYawRef() = 归零以来的编码器转角 (未校准)
+ *   三者同零点, 可直接相互对比以定位标度误差归属。
+ *   上电后若还没归零过, 基准与三个累加器都是 0, 相对角即"上电以来的转角"。
+ */
+float SensorFusion_GetYawRef(void);
+
+/**
  * @brief  复位航向为 0 (每轮任务开始/卸货后调用, 与 Odometry_ResetHeading 同语义)
  * @note   只清航向状态, 不改融合算法/噪声参数。
  *         建议同时调 IMU 配置复位 yaw (若模组支持) 或重新对齐零点。

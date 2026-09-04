@@ -17,14 +17,12 @@
 typedef enum {
   CONTROL_MANUAL = 0,
   CONTROL_AUTO = 1,
-  CONTROL_RETURN = 2,
   CONTROL_ROTATE = 3
 } ControlMode_t;
 
-/* 返航/掉头与自动任务共用状态机主循环。 */
+/* 蓝牙定角掉头与自动任务共用状态机主循环。 */
 #define IS_MOTION_LOOP_MODE(mode) \
-  ((mode) == CONTROL_AUTO || (mode) == CONTROL_RETURN || \
-   (mode) == CONTROL_ROTATE)
+  ((mode) == CONTROL_AUTO || (mode) == CONTROL_ROTATE)
 
 static ControlMode_t s_mode;
 static MotionCommand_t s_command;
@@ -72,7 +70,7 @@ static void StopAndResetAuto(void)
 
 static void SetManualMotion(float v, float w)
 {
-  if (s_mode == CONTROL_RETURN || s_mode == CONTROL_ROTATE) {
+  if (s_mode == CONTROL_ROTATE) {
     StopWheels();
     MotionStrategy_Stop();
     s_mode = CONTROL_MANUAL;
@@ -189,13 +187,6 @@ static void HandleBluetooth(uint32_t now)
       ImuOdometry_SetHome();
       s_mode = CONTROL_MANUAL;
       break;
-    case HC05_EVENT_RETURN:
-      ActuatorServos_Stop();
-      StopWheels();
-      MotionStrategy_RequestReturn();
-      s_mode = CONTROL_RETURN;
-      s_motion_tick = now;
-      break;
     case HC05_EVENT_ROTATE_180:
       ActuatorServos_Stop();
       StopWheels();
@@ -217,67 +208,40 @@ static void HandleBluetooth(uint32_t now)
   }
 }
 
-static void SendTelemetry(uint32_t now)
+/*
+ * 遥测精简为 9 个字段, 一行发完 (约 120 字节, 远低于 DbgUart 的 240 字节缓冲),
+ * 所以不再像以前那样拆成四条。字段顺序即固定的线上顺序。
+ *
+ * state  状态机数值编号。会随 MotionState_t 增删而整体前移, 请对照
+ *        motion_config.h 的枚举读, 别记死数字 (state_name 已不再发送)。
+ * hdg_deg 融合航向, 0~359 角度制, 上电为 0, 左转(CCW)增大、右转(CW)减小,
+ *        0/360 处回绕。蓝牙 SET_HOME 与 AUTO 起步会重新归零。全车控制用的
+ *        就是这一路。
+ * bear_deg 返航直线段该朝的方向, 与 hdg_deg 同零点同量纲 (0~359)。返航中报
+ *        HOME_PREPARE 锁定的方位角 (含遇墙退避累计的右旋量), 其余时候报当前
+ *        位置指向原点的实时方位角。hdg_deg 减 bear_deg 就是航向偏差, 直接看
+ *        得出车有没有对准家。
+ * color  视觉目标类型: 0=无, 1=红, 2=黄, 3=黑色卸货区。
+ *
+ * 其余字段的取数函数都还在 (ImuOdometry_GetImuYawDeg / GetEncHeadingDeg /
+ * IsImuAlive 等), 只是不再打印 —— 要临时加回某个观察量, 在下面的格式串里补
+ * 一项即可。
+ */
+static void SendTelemetry(void)
 {
-  float linear_cm_s;
-  float angular_deg_s;
-  const float rad_to_deg = 180.0f / 3.14159265358979f;
-
   OpenMvUart_GetLatest(&s_vision);
-  OpenMvUart_GetWall(&s_vision_wall);
-  OpenMvUart_GetArrival(&s_vision_arrival);
 
-  linear_cm_s = ImuOdometry_GetLinearVelocityCmS();
-  angular_deg_s = ImuOdometry_GetYawRateRadS() * rad_to_deg;
-
-  /* 分四次发送：单条格式化结果已接近 DbgUart 的 240 字节缓冲上限，
-   * 状态名较长或运行时间变大时会被截断，拆开后线上字节序列不变。 */
-  DbgUart_Printf("S,%lu,mode=%u,v_cm_s_x10=%ld,w_deg_s_x10=%ld,count=%u,"
-                 "state=%u,state_name=%s,\n",
-    (unsigned long)now, (unsigned int)s_mode,
-    (long)DbgUart_Scaled(linear_cm_s, 10.0f),
-    (long)DbgUart_Scaled(angular_deg_s, 10.0f),
+  DbgUart_Printf("count=%u,state=%u,home_x=%d,home_y=%d,hdg_deg=%d,"
+                 "bear_deg=%d,color=%u,vision_ok=%lu,vision_bad=%lu\n",
     (unsigned int)MotionStrategy_GetCollectedCount(),
     (unsigned int)MotionStrategy_GetState(),
-    MotionStrategy_GetStateName());
-
-  /* yaw_imu / yaw_enc 是未校准的分源航向，用来定位标度误差归属。 */
-  DbgUart_Printf("home_x=%d,home_y=%d,hdg_deg=%d,bear_deg=%d,"
-                 "imu=%u,yaw_imu=%d,yaw_enc=%d\n",
     (int)ImuOdometry_GetXcm(),
     (int)ImuOdometry_GetYcm(),
     (int)ImuOdometry_GetHeadingDeg(),
     (int)ImuOdometry_GetBearingDeg(),
-    (unsigned int)ImuOdometry_IsImuAlive(),
-    (int)ImuOdometry_GetImuYawDeg(),
-    (int)ImuOdometry_GetEncHeadingDeg());
-
-  DbgUart_Printf("det=%u,color=%u,cx=%u,cy=%u,xoff=%d,yoff=%d,"
-                 "dist=%u,vision_ok=%lu,vision_bad=%lu\n",
-    (unsigned int)s_vision.detected,
     (unsigned int)s_vision.object_type,
-    (unsigned int)s_vision.center_x_px,
-    (unsigned int)s_vision.center_y_px,
-    (int)s_vision.x_offset_px, (int)s_vision.y_offset_px,
-    (unsigned int)s_vision.distance_cm,
     (unsigned long)OpenMvUart_GetValidFrameCount(),
     (unsigned long)OpenMvUart_GetInvalidFrameCount());
-
-  /* vwall_* 来自 OpenMV 的 W 帧 (蓝色边界墙)，是车上唯一的障碍感知。
-   * vwall=1 表示已近到触发退避；vwall_pct 是蓝色占 ROI 的百分比，
-   * 用它对照实测位置标定 OpenMV 侧的 WALL_FILL_ENTER/EXIT_PCT。
-   * arv_* 来自 A 帧 (黑区到位)，只在黑区模式下刷新，物块模式恒为 0；
-   * arv_pct 是黑区外框占画面的百分比，用它标定 BLACK_ARRIVAL_FILL_PCT。 */
-  DbgUart_Printf("vwall=%u,vwall_pct=%u,vwall_ok=%u,wall_frames=%lu,"
-                 "arv=%u,arv_pct=%u,arv_ok=%u,arv_frames=%lu\n",
-    (unsigned int)s_vision_wall.blocked,
-    (unsigned int)s_vision_wall.fill_pct,
-    (unsigned int)s_vision_wall.valid,
-    (unsigned long)OpenMvUart_GetWallFrameCount(),
-    (unsigned int)s_vision_arrival.arrived,
-    (unsigned int)s_vision_arrival.fill_pct,
-    (unsigned int)s_vision_arrival.valid,
-    (unsigned long)OpenMvUart_GetArrivalFrameCount());
 }
 
 void AppCore_Init(void)
@@ -328,6 +292,6 @@ void AppCore_Run(void)
 
   if ((uint32_t)(now - s_telemetry_tick) >= TELEMETRY_PERIOD_MS) {
     s_telemetry_tick = now;
-    SendTelemetry(now);
+    SendTelemetry();
   }
 }
