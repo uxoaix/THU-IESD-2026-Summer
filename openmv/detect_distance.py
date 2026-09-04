@@ -34,6 +34,9 @@ wall_state = 0
 locked_target = None
 LOCK_LOST_PAUSE_MS = 1300
 lock_pause_started_ms = None
+LOCK_MISS_GRACE_MS = 300
+lock_missing_started_ms = None
+last_locked_output = None
 LOCK_MAX_MOVE_PX = 100
 LOCK_MIN_SIZE_RATIO = 0.35
 LOCK_MAX_SIZE_RATIO = 3.0
@@ -41,6 +44,7 @@ LOCK_MAX_SIZE_RATIO = 3.0
 def read_stm32_mode():
     """Apply the latest M,0 / M,1 command sent by the STM32."""
     global detection_mode, locked_target, lock_pause_started_ms
+    global lock_missing_started_ms, last_locked_output
     while uart.any():
         line = uart.readline()
         if not line:
@@ -55,6 +59,8 @@ def read_stm32_mode():
             detection_mode = 1
             locked_target = None
             lock_pause_started_ms = None
+            lock_missing_started_ms = None
+            last_locked_output = None
 
 
 def send_target(color, cx, cy, distance_cm):
@@ -106,38 +112,94 @@ def expanded_blob_roi(blob, margin, image_width, image_height):
     return (left, top, right - left, bottom - top)
 
 
-def count_black_pixels(img, sample_roi):
-    black_pixels = 0
-    for black_blob in img.find_blobs(
-        [BLACK_CONFIG[2]],
+def count_threshold_pixels(img, sample_roi, threshold):
+    matched_pixels = 0
+    for matched_blob in img.find_blobs(
+        [threshold],
         roi=sample_roi,
         pixels_threshold=BLACK_SAMPLE_MIN_PIXELS,
         area_threshold=BLACK_SAMPLE_MIN_PIXELS,
         merge=False,
     ):
-        black_pixels += black_blob.pixels
-    return black_pixels
+        matched_pixels += matched_blob.pixels
+    return matched_pixels
 
 
-def black_ratio_around_blob(img, blob):
-    """Count actual black-threshold pixels in the 10-pixel area around a blob."""
+def ring_threshold_pixels(img, blob, sample_roi, threshold):
+    outer_pixels = count_threshold_pixels(img, sample_roi, threshold)
+    inner_roi = (blob.x, blob.y, blob.w, blob.h)
+    inner_pixels = count_threshold_pixels(img, inner_roi, threshold)
+    return max(0, outer_pixels - inner_pixels)
+
+
+def occupied_ratio_around_blob(img, blob):
+    """Count black, red, and yellow pixels in the ring around a blob."""
     sample_roi = expanded_blob_roi(
         blob,
         BLACK_SAMPLE_MARGIN,
         IMAGE_WIDTH,
         IMAGE_HEIGHT,
     )
-    outer_black_pixels = count_black_pixels(img, sample_roi)
-    inner_roi = (blob.x, blob.y, blob.w, blob.h)
-    inner_black_pixels = count_black_pixels(img, inner_roi)
-    black_pixels = max(0, outer_black_pixels - inner_black_pixels)
+    black_pixels = ring_threshold_pixels(
+        img,
+        blob,
+        sample_roi,
+        BLACK_CONFIG[2],
+    )
+    red_pixels = 0
+    yellow_pixels = 0
+    for object_type, color_name, threshold, box_color, known_width_mm in color_configs:
+        color_pixels = ring_threshold_pixels(img, blob, sample_roi, threshold)
+        if object_type == RED_TYPE:
+            red_pixels += color_pixels
+        elif object_type == YELLOW_TYPE:
+            yellow_pixels += color_pixels
 
     surrounding_area = sample_roi[2] * sample_roi[3] - blob.w * blob.h
     if surrounding_area <= 0:
-        return sample_roi, black_pixels, 0.0
+        return sample_roi, black_pixels, red_pixels, yellow_pixels, 0.0
 
-    black_ratio = min(1.0, black_pixels / surrounding_area)
-    return sample_roi, black_pixels, black_ratio
+    occupied_pixels = min(
+        surrounding_area,
+        black_pixels + red_pixels + yellow_pixels,
+    )
+    occupied_ratio = occupied_pixels / surrounding_area
+    return (
+        sample_roi,
+        black_pixels,
+        red_pixels,
+        yellow_pixels,
+        occupied_ratio,
+    )
+
+def ground_ratio_around_blob(img, blob):
+    """Count ground-threshold pixels in the margin ring around a blob."""
+    sample_roi = expanded_blob_roi(
+        blob,
+        BLACK_SAMPLE_MARGIN,
+        IMAGE_WIDTH,
+        IMAGE_HEIGHT,
+    )
+    white_pixels = ring_threshold_pixels(
+        img,
+        blob,
+        sample_roi,
+        GROUND_THRESHOLD,
+    )
+    surrounding_area = sample_roi[2] * sample_roi[3] - blob.w * blob.h
+    if surrounding_area <= 0:
+        return sample_roi, white_pixels, 0.0
+
+    occupied_pixels = min(
+        surrounding_area,
+        white_pixels,
+    )
+    occupied_ratio = occupied_pixels / surrounding_area
+    return (
+        sample_roi,
+        white_pixels,
+        occupied_ratio,
+    )
 
 
 def matching_locked_blob(candidates, lock):
@@ -178,6 +240,10 @@ sensor.skip_frames(time=2000)
 sensor.set_auto_gain(False)
 sensor.set_auto_whitebal(False)
 
+print("Exposure fixed: %d us" % sensor.get_exposure_us())
+
+
+
 green_led = LED(2)
 blue_led = LED(3)
 red_led = LED(1)
@@ -201,13 +267,18 @@ color_configs = (
 
 # Black unload area. Threshold must be re-tuned on the real field.
 BLACK_CONFIG = (BLACK_TYPE, "BLACK", (0, 45, -15, 18, -21, 10), (0, 0, 255), 400.0)
+GROUND_THRESHOLD = (77, 100, -48, 23, -14, 23)
 # The area is a large floor region, so it needs a bigger blob and merging.
 BLACK_PIXELS_THRESHOLD = 300
-BLACK_ARRIVAL_FILL_PCT = 15
-# Red/yellow exclusion: sample a rectangle expanded by 10 pixels on every side.
+BLACK_ARRIVAL_FILL_PCT = 12
+# Red/yellow exclusion: inspect a configurable ring around every candidate.
 BLACK_SAMPLE_MARGIN = 5
 BLACK_SAMPLE_MIN_PIXELS = 2
-BLACK_AROUND_REJECT_RATIO = 0.20 # Reported distance per pixel of gap below the area's near edge.
+# The ring must contain black first; then black+red+yellow coverage is tested.
+SURROUNDING_REJECT_RATIO = 0.15
+# Ground around the object overrides black-area rejection above this ratio.
+GROUND_KEEP_RATIO = 0.65
+# Reported distance per pixel of gap below the area's near edge.
 # Increase it if the car stops too early, decrease it if it overshoots.
 BLACK_NEAR_EDGE_CM_PER_PX = 0.3
 
@@ -227,7 +298,7 @@ WALL_PIXELS_THRESHOLD = 60
 # Two thresholds give hysteresis, so the flag does not chatter at the edge.
 # Calibrate by reading the percentage reported to the STM32.
 WALL_FILL_ENTER_PCT = 95
-WALL_FILL_EXIT_PCT = 75
+WALL_FILL_EXIT_PCT = 70
 
 # Smaller values make detection more sensitive, but may also detect noise.
 # QVGA blob area is a quarter of the VGA area for the same object.
@@ -247,11 +318,14 @@ FOCAL_LENGTH_PX = 185
 clock = time.clock()
 
 while True:
+    # Auto exposure is still enabled here; report its stabilized value once at boot.
+    print("Exposure: %d us" % sensor.get_exposure_us())
     clock.tick()
     read_stm32_mode()
     img = sensor.snapshot()
     candidates = []
     black_sample_debug = []
+    held_output = None
 
     lock_pause_active = False
     if lock_pause_started_ms is not None:
@@ -321,6 +395,7 @@ while True:
 
 
     if detection_mode == 1:
+        sensor.set_auto_exposure(False, exposure_us=13000)
         green_led.off()
         blue_led.on()
         # Unload area: direct LAB color blob detection, no binary copy.
@@ -337,6 +412,7 @@ while True:
     elif detection_mode == 0 and not lock_pause_active:
         blue_led.off()
         green_led.on()
+        sensor.set_auto_exposure(False, exposure_us=11000)
 
         # Detect each color separately, then select one global largest valid blob.
         for object_type, color_name, threshold, box_color, known_width_mm in color_configs:
@@ -359,18 +435,39 @@ while True:
                 if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
                     continue
 
-                sample_roi, black_pixels, black_ratio = black_ratio_around_blob(
-                    img,
-                    blob,
+                (
+                    sample_roi,
+                    black_pixels,
+                    red_pixels,
+                    yellow_pixels,
+                    occupied_ratio,
+                ) = occupied_ratio_around_blob(img, blob)
+                (
+                    ground_sample_roi,
+                    ground_pixels,
+                    ground_ratio,
+                ) = ground_ratio_around_blob(img, blob)
+                has_black = black_pixels >= BLACK_SAMPLE_MIN_PIXELS
+                ignored = (
+                    has_black
+                    and occupied_ratio >= SURROUNDING_REJECT_RATIO
+                    and ground_ratio <= GROUND_KEEP_RATIO
                 )
-                ignored = black_ratio >= BLACK_AROUND_REJECT_RATIO
                 black_sample_debug.append((sample_roi, ignored))
                 print(
                     color_name,
-                    "black around:",
+                    "around black:",
                     black_pixels,
-                    "ratio:",
-                    black_ratio,
+                    "red:",
+                    red_pixels,
+                    "yellow:",
+                    yellow_pixels,
+                    "occupied:",
+                    occupied_ratio,
+                    "ground:",
+                    ground_pixels,
+                    "ground ratio:",
+                    ground_ratio,
                 )
                 if ignored:
                     print("Ignore", color_name, "in black area")
@@ -404,18 +501,37 @@ while True:
             if target is not None:
                 blob = target[0]
                 locked_target = (target[1], blob.cx, blob.cy, blob.w, blob.h)
+                lock_missing_started_ms = None
         else:
             target = matching_locked_blob(candidates, locked_target)
             if target is None:
-                locked_target = None
-                lock_pause_started_ms = time.ticks_ms()
+                if lock_missing_started_ms is None:
+                    lock_missing_started_ms = time.ticks_ms()
+
+                elapsed_ms = time.ticks_diff(
+                    time.ticks_ms(),
+                    lock_missing_started_ms,
+                )
+                if elapsed_ms < LOCK_MISS_GRACE_MS:
+                    held_output = last_locked_output
+                else:
+                    locked_target = None
+                    lock_missing_started_ms = None
+                    lock_pause_started_ms = time.ticks_ms()
             else:
                 blob = target[0]
                 locked_target = (target[1], blob.cx, blob.cy, blob.w, blob.h)
+                lock_missing_started_ms = None
     else:
         target = None
 
     if target is None:
+        if held_output is not None:
+            held_type, held_cx, held_cy, held_distance_cm = held_output
+            print("Hold locked target", held_type, held_cx, held_cy)
+            send_target(held_type, held_cx, held_cy, held_distance_cm)
+            continue
+
         print("No target found, mode", detection_mode, "pause", lock_pause_active)
         if detection_mode == 1:
             send_arrival(0, 0)
@@ -431,6 +547,7 @@ while True:
     cy = blob.cy
 
     if object_type == BLACK_TYPE:
+        cx = cx + 10
         # Use actual threshold-matched pixels, not the axis-aligned w*h box.
         # This excludes non-black background inside a slanted bounding box.
         black_fill_pct = min(
@@ -440,7 +557,6 @@ while True:
         black_arrived = 1 if black_fill_pct > BLACK_ARRIVAL_FILL_PCT else 0
         send_arrival(black_arrived, black_fill_pct)
         print("BLACK", black_arrived, black_fill_pct)
-
         # A floor region fills the frame when close, so its width saturates.
         # Use the gap between its near edge and the image bottom instead:
         # the gap shrinks to zero as the car drives onto the area.
@@ -465,3 +581,5 @@ while True:
 
     print("TX", object_type, cx, cy, distance_cm)
     send_target(object_type, cx, cy, distance_cm)
+    if detection_mode == 0:
+        last_locked_output = (object_type, cx, cy, distance_cm)
