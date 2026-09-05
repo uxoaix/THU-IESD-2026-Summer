@@ -164,10 +164,11 @@ typedef struct {
  *   下列线速度已整体上调 15% (原值见括号)。角速度一律未动: 扫视角速度关系到
  *   单帧识别时间, 定角旋转角速度关系到停角精度, 两者都不能跟着线速度涨。 */
 #define MAX_LINEAR_SPEED_CM_S            50.0f     /* 限幅, 非阶段速度, 未上调 */
-#define MAX_ANGULAR_SPEED_RAD_S          1.0f      /* 最大角速度 (rad/s) */
+#define MAX_ANGULAR_SPEED_RAD_S          1.0f
+/* 最大角速度 (rad/s) */
 #define MAX_WHEEL_ACCEL_CM_S2            120.0f
-#define SEARCH_ROTATION_SPEED_DEG_S      30.0f
-#define TRACKING_LINEAR_SPEED_CM_S       30.0f     /* 20.0 */
+#define SEARCH_ROTATION_SPEED_DEG_S      40.0f
+#define TRACKING_LINEAR_SPEED_CM_S       35.0f     /* 20.0 */
 #define COLLECT_LINEAR_SPEED_CM_S        8.0f      /* 无调用方, 未上调 */
 #define MANUAL_LINEAR_SPEED_CM_S         23.0f     /* 20.0 */
 #define MANUAL_ROTATE_SPEED_DEG_S        40.0f
@@ -181,7 +182,7 @@ typedef struct {
 #define VISION_CENTER_Y_PX               (VISION_IMAGE_HEIGHT_PX / 2U)
 #define CAMERA_X_AXIS_REVERSED            1U  /* 摄像头倒装，左右图像坐标取反 */
 #define TRACKING_DEADZONE_PX             8
-#define TRACKING_CENTER_OFFSET_PX       (-30) /* 摄像头安装偏移，随QVGA分辨率减半 */
+#define TRACKING_CENTER_OFFSET_PX       (-20) /* 摄像头安装偏移，随QVGA分辨率减半 */
 /*
  * PRE_CENTERING 原地对准的两个专用参数, 解决"只差一点却转不动"。
  *
@@ -199,7 +200,7 @@ typedef struct {
 #define PRE_CENTERING_EXIT_PX            20
 #define TARGET_DISTANCE_MAX_CM           50U
 #define COLLECT_DISTANCE_CM              10U
-#define FINAL_APPROACH_DURATION_MS       700U /* 追踪结束后保持追踪速度前进1秒 */
+#define FINAL_APPROACH_DURATION_MS       400U /* 追踪结束后保持追踪速度前进1秒 */
 /* 黑区到位判据: 由 OpenMV 的 A 帧直接给出 (见 §5.1), STM32 不再自己算距离。
  * 阈值 BLACK_ARRIVAL_FILL_PCT 在 detect_distance.py 里, 用遥测 arv_pct 标定。
  * 这里只做一层去抖: A 帧没有迟滞, 阴影和黑区连成一片时单帧占比会突跳,
@@ -217,7 +218,8 @@ typedef struct {
  *       → HOME_FOLLOW 朝该方位角直行, 只走 d 的 HOME_PARTIAL_RETURN_RATIO
  *         (航向偏差大就先原地转, 见 HOME_ROTATE_IN_PLACE_DEG)
  *       → 走完 / 已进 HOME_ARRIVAL_RADIUS_CM / 兜底超时 → BLACK_AREA_SEARCH
- *       全程盯着黑区, 确认看见就直接交给 BLACK_AREA_TRACK。
+ *       走过 HOME_VISION_ENABLE_RATIO 之后才开始认黑区, 认到就直接交给
+ *       BLACK_AREA_TRACK (前半程不认, 防止扎向对方的卸货区)。
  *
  * 为什么只走一部分而不是走到原点: 位置是编码器速度的二次积分, 打滑和标定
  * 误差随路程累积, 走完全程终点会明显偏离原点。所以直线段只负责"把车带到
@@ -232,16 +234,38 @@ typedef struct {
 /* 直线段只走全程的这个比例, 余下距离作为退出阈值。
  * 调大 = 更依赖里程计精度, 调小 = 更早交给视觉但可能离黑区太远看不见。 */
 #define HOME_PARTIAL_RETURN_RATIO        0.75f  /* 0.5 / 0.2 */
+/*
+ * 走过全程的这个比例之后才解锁视觉交接; 在此之前是纯里程计返航 —— 朝锁定的
+ * 方位角开, 看见黑区也不理。
+ *
+ * 为什么要压后: 场地上有两个黑色卸货区 (自己的和对方的), OpenMV 只认"黑色
+ * 色块"、分不出是谁的。返航刚起步时车还在场地远端, 此时最容易先看见对方的
+ * 卸货区并一头扎过去。走过一段路程后车已经偏向自己这侧, 视野里出现的
+ * 黑区是自己家的概率高得多。
+ *
+ * 注意这道门只拦"认不认", 不切模式: OpenMV 返航全程都留在黑区模式 (M,1)。
+ * 前半程改回物块模式没有意义 (返航途中不收物块), 还要在解锁点再切回来、
+ * 白等 OpenMV 重新稳定几帧, 而黑区到位帧 (A) 也只在黑区模式下发。
+ *
+ * 代价: 解锁前即使自己的黑区就在眼前也不会交接, 会一直走到 1/3 才开始认。
+ * 所以这个值不能太大 —— 留给视觉的窗口是 1/3 到 3/4 这一段, 太靠后会来不及
+ * 确认就到了直线段终点 (那时转 BLACK_AREA_SEARCH 原地扫, 仍能找, 只是慢)。
+ * 从 0.5 降到 1/3 是把窗口前移加长, 代价是误认对方黑区的风险相应上升。
+ *
+ * 注意必须小于 HOME_PARTIAL_RETURN_RATIO, 否则视觉窗口为空, 等于关掉了
+ * 途中交接。
+ */
+#define HOME_VISION_ENABLE_RATIO         0.05f  /* 1/3, 原 0.5 */
 /* 直线段兜底超时: 里程计异常 (比如打滑导致距离一直不减) 时也能往下走。 */
 #define HOME_FOLLOW_TIMEOUT_MS           20000U
 /* 到原点的判定半径。因为有 PARTIAL_RETURN_RATIO, 通常先按比例退出, 这个值
  * 只是"出发时就已经离原点很近"的兜底判据。 */
 #define HOME_ARRIVAL_RADIUS_CM           12.0f
 /*
- * 返航途中的视觉交接: 返航全程 OpenMV 都处于黑区模式, 一旦连续
+ * 返航途中的视觉交接: 走过 HOME_VISION_ENABLE_RATIO 解锁之后, 一旦连续
  * HOME_VISION_CONFIRM_MS 都看见黑区就直接进 BLACK_AREA_TRACK。
  * CONFIRM_MS 用来滤掉单帧闪跳; 被蓝墙退避打断时计时清零 (累加逻辑在 switch
- * 之前, 只在 s_state 为 HOME_FOLLOW 时累加)。
+ * 之前, 只在 s_state 为 HOME_FOLLOW 且交接已解锁时累加)。
  *
  * 这里没有距离门限: 虽然返航有位置估计, 但里程计误差正是要靠视觉消掉的东西,
  * 用它去给视觉设门限就本末倒置了。代价是误检风险全靠 OpenMV 侧
@@ -266,12 +290,43 @@ typedef struct {
  * 它不会改变 hdg_deg 读数, 但会让 home_x/home_y 与 bear_deg 一起转过去。
  * 只有在确认车实际走的方向与航向读数存在固定夹角时才动它。 */
 #define HOME_HEADING_OFFSET_DEG          0.0f
-/* 卸货前的原地掉头, 融合航向闭环 (不是按时间开环)。
- * 转不够 180° 车尾就没对准黑区, 物块会卸到区外, 所以停角精度要紧:
- * 由 FUSION_YAW_SCALE 与下面的 TOL 共同决定, 用蓝牙 ROTATE180 在地面验证。 */
-#define HOME_TURN_AROUND_TARGET_DEG      180.0f
+/*
+ * 卸货前的原地掉头, 融合航向闭环 (不是按时间开环)。
+ * 转不够 180° 车尾就没对准黑区, 物块会卸到区外, 所以停角精度要紧。
+ *
+ * TARGET 故意大于 180: 实测下 180° 指令只转到 165~170°, 即原地旋转时融合航向
+ * 高估了转角 (四轮滑移转向, 编码器推算的转角虚高, 把融合航向拽了上去), 车提前
+ * 认为转够就停。扣掉当时 tol=5 那一份, 净标度高估约 4~6%。
+ *   反解: 实测 167.5° 对应报出 175° → 比例 1.045
+ *         新 TARGET = 180 × 1.045 + 新 tol(2) ≈ 190
+ *
+ * 为什么补在这里而不是改 FUSION_YAW_SCALE:
+ *   1) 那个系数同时喂着 home_x/home_y 位置积分、返航方位角、搜索转向瞄准。
+ *      为修一个掉头动作去动它, 会把 3/4 返航的落点一起带偏。
+ *   2) 这个高估是"动作相关"的, 不是全局固定值: 原地旋转四轮全程打滑, 高估最
+ *      重; 直线行驶几乎不打滑, 基本没有。用一个全局系数去配单一动作必然按下
+ *      葫芦起了瓢。
+ *   3) 0.85 本身就是当年用空载 ROTATE180 标的, 而卸货掉头时斗里装着物块, 载
+ *      荷和打滑特性都变了 —— 残留这几个百分点很可能就来自这个差别, 这也正是
+ *      它该由本动作自己补的理由。
+ * 所以蓝牙 ROTATE180 不要跟着改: 那条路径空载, 现在本来就准。
+ * 重标方法: 烧上去实测掉头角 a, 新值 = 当前值 × 180 / a。
+ *
+ * 现场修正: 190 实测转过头, 按上面的方法回调到 185 (190 × 180 / 185 ≈ 180)。
+ * 也就是净标度高估比上面反解出的 4.5% 略小, 约 2.8%。
+ */
+#define HOME_TURN_AROUND_TARGET_DEG      185.0f /* 190.0 → 180.0 */
 #define HOME_TURN_AROUND_SPEED_DEG_S     45.0f
-#define HOME_TURN_AROUND_TOL_DEG         5.0f
+/*
+ * TOL 直接等于一份系统性欠转: RotateCwStep 一进容差带就停在近边, 所以 tol=5
+ * 意味着最多只转到 175°, 实测"不到 180"里必然含这 5°。
+ *
+ * 压到 2 是安全的: 末段有减速窗 (剩余 30° 内降到 18°/s), 一个 50ms 周期只走
+ * 0.9°, 2° 的带宽有两个多周期, 不会被一步跨过去; 停车后的惯性滑行方向是继续
+ * 往前转, 对"欠转"这个问题只有帮助。
+ * 别再往下压到 1 以内: 那已经接近单周期步长, 会在目标附近反复判不到。
+ */
+#define HOME_TURN_AROUND_TOL_DEG         2.0f  /* 5.0 */
 #define HOME_TURN_AROUND_TIMEOUT_MS      10000U
 /* 掉头后再倒一段: 车尾(后斗/门)此时朝着黑区, 多退一点能把卸货点从黑区
  * 边缘挪到中间, 免得物块滚出区外。车尾没有传感器, 只能用固定时长限量。
@@ -434,17 +489,24 @@ typedef struct {
  */
 #define WALL_STRUGGLE_TIMEOUT_MS         10000U
 
-/* 13. 滚刷控制参数 */
+/* 13. 滚刷控制参数
+ *   BRUSH_COLLECT 只等滚刷走完 (约 2s) 就转下一轮搜索; 收集用的后斗升降是
+ *   "发指令即走", 由 ActuatorServos_Run 在后台跑完, 与下一轮搜索并行, 所以
+ *   本阶段不再包含 BUCKET_OUTBOUND/RETURN_MS 那 2s。
+ *   注意别把 DELAY 调到很大: 它是留在 BRUSH_COLLECT 里干等的, 不像升降本身
+ *   能被并行吃掉。 */
 #define BRUSH_ROTATE_DURATION_MS         (BRUSH_OUTBOUND_MS + BRUSH_RETURN_MS)
 #define BRUSH_TIMEOUT_MS                 3500U     /* 滚刷动作超时保护 */
-#define COLLECT_BUCKET_DELAY_MS          150U      /* 滚刷完成后再启动后斗 */
+/* 滚刷完成后隔这么久再发后斗指令, 避免两个舵机同时启动的冲击电流。 */
+#define COLLECT_BUCKET_DELAY_MS          150U
 
 /* 14. 后斗卸载参数
- *   序列: 开门 → 升降 → 前进 0.5s → 升降 → 关门 → 左前方弧线开出黑区。
+ *   序列: 开门 → 升降 → 前进 0.5s → 升降 → 左前方弧线开出黑区 → 关门。
  *   两轮升降之间挪一小段, 让第二轮卸在稍微不同的位置, 免得所有物块堆在
  *   同一点上互相挡住出口。
- *   门只开关一次, 全程保持打开: 物块常卡在斗底或门边, 只有门开着时反复升降
- *   才能把它抖出去; 每轮都开关门既慢, 抖动也只在开门那一刻才有效。
+ *   门只开关一次, 从开门一直开到驶出黑区之后: 物块常卡在斗底或门边, 只有门
+ *   开着时反复升降才能把它抖出去; 每轮都开关门既慢, 抖动也只在开门那一刻才
+ *   有效。关门放在开出黑区之后, 是为了让开出那 2.5s 的颠簸也能继续抖料。
  *   升降不留停留时间, 只等舵机走完行程就反向 —— 抖动靠的是升降本身的冲击,
  *   停在顶端并不会让卡住的物块自己滑出去。
  *   合计约 0.5 + 2 + 0.5 + 2 + 0.5 + 2.5 = 8.0s。 */
@@ -466,12 +528,12 @@ typedef struct {
  * 卸完货开出黑区再进下一轮: 车尾还压在卸货区上, 直接原地起转会把刚倒出来
  * 的物块扫散。走弧线朝左前方离开, 结束时车头已偏左 UNLOAD_EXIT_TURN_DEG,
  * 下一轮搜索的起始朝向与上一轮不同, 不会反复扫同一片区域。
- * 速度取与 HOME_DONE 倒车段相同; 2.5s 约 43cm 弧长, 回转半径约 82cm。
+ * 速度取与 HOME_DONE 倒车段相同; 2.5s 约 43cm 弧长, 回转半径约 55cm。
  * 同样是开环: 本状态不做蓝墙退避, 前方有墙不会被察觉。
  */
 #define UNLOAD_EXIT_FORWARD_MS           2500U
 #define UNLOAD_EXIT_SPEED_CM_S           HOME_BACKUP_SPEED_CM_S
-#define UNLOAD_EXIT_TURN_DEG             30.0f  /* 整段累计左偏角 */
+#define UNLOAD_EXIT_TURN_DEG             45.0f  /* 整段累计左偏角, 原 30 */
 /* 摊到整段上的转速; 改上面两个值时自动跟随。调用处取正 = 左转 (逆时针)。 */
 #define UNLOAD_EXIT_TURN_DEG_S \
   (UNLOAD_EXIT_TURN_DEG * 1000.0f / (float)UNLOAD_EXIT_FORWARD_MS)
@@ -630,7 +692,7 @@ typedef struct {
 #define CAMERA_RETURN_MS                 1000U
 
 #define BUCKET_START_DEG                 0U
-#define BUCKET_END_DEG                   120U
+#define BUCKET_END_DEG                   110U
 #define BUCKET_OUTBOUND_MS               1000U
 #define BUCKET_RETURN_MS                 1000U
 

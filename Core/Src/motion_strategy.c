@@ -24,6 +24,11 @@ static float s_rotate_target_deg;
 static uint8_t s_task_complete;
 /* 返航直线段的退出阈值: 距原点还剩这么多就收手, 见 HOME_PARTIAL_RETURN_RATIO。 */
 static float s_move_target_cm;
+/* 返航开始认黑区的阈值: 距原点还剩这么多才允许视觉交接, 见
+ * HOME_VISION_ENABLE_RATIO。比 s_move_target_cm 大, 所以先到这个门再到终点。 */
+static float s_home_vision_cm;
+/* 返航视觉交接已解锁 (过了上面那道门)。只升不降, 见 HOME_FOLLOW 里的说明。 */
+static uint8_t s_home_vision_on;
 /* 蓝墙退避: 记住被打断的状态，退开后原样恢复，不影响任务进度。 */
 static MotionState_t s_backoff_return_state;
 /* 蓝墙退避: 连续无墙时长，用于退出判据的去抖。 */
@@ -332,6 +337,8 @@ void MotionStrategy_Init(void)
   s_rotate_target_deg = 0.0f;
   s_task_complete = 0U;
   s_move_target_cm = 0.0f;
+  s_home_vision_cm = 0.0f;
+  s_home_vision_on = 0U;
   s_backoff_return_state = MOTION_STATE_ROTATE_SEARCH;
   s_wall_clear_ms = 0U;
   s_arrive_confirm_ms = 0U;
@@ -436,11 +443,13 @@ void MotionStrategy_Update(const VisionData_t *vision,
    * 返航途中的视觉交接确认。放在 switch 之前而不是各状态里面，是为了让
    * "被蓝墙退避打断"自动等价于"连续性中断"：退避期间 s_state 是
    * WALL_BACKOFF，走 else 分支清零，不必再往 Enter() 里加特例。
-   * 没有距离门限，误检全靠 OpenMV 的 BLACK_PIXELS_THRESHOLD 把关，
-   * 见 motion_config.h 里 HOME_VISION_CONFIRM_MS 的说明。
+   * s_home_vision_on 是"已走过 HOME_VISION_ENABLE_RATIO"的门：解锁前纯里程计
+   * 返航，看见黑区也不累加，免得认成对方的卸货区。
+   * 除这道门之外没有别的距离门限，误检全靠 OpenMV 的 BLACK_PIXELS_THRESHOLD
+   * 把关，见 motion_config.h 里 HOME_VISION_CONFIRM_MS 的说明。
    */
   if (s_state == MOTION_STATE_HOME_FOLLOW &&
-      s_black_target && wanted_detected) {
+      s_home_vision_on && s_black_target && wanted_detected) {
     s_home_seen_ms += elapsed_ms;
   } else {
     s_home_seen_ms = 0U;
@@ -723,6 +732,16 @@ void MotionStrategy_Update(const VisionData_t *vision,
     break;
 
   case MOTION_STATE_BRUSH_COLLECT:
+    /*
+     * 只等滚刷走完就走，后斗升降与下一轮搜索并行。
+     *
+     * 能这么做是因为舵机模块是自治的：TriggerCycle 只设一次目标角并起计时，
+     * 之后 AT_END → RETURNING → IDLE 由主循环里的 ActuatorServos_Run() 自己
+     * 推进，与运动状态机无关。所以发完指令就能转下一轮，升降会在搜索/对准
+     * 的过程中自行完成，省下原来干等后斗的约 2s。
+     * cycle 标志是一次性脉冲（Update 开头统一清零），本周期设上就会被紧随
+     * 其后的 ActuatorServos_Apply 消费，同周期 Enter() 不影响它生效。
+     */
     Motion_StopOutput(out);
     if (s_action_step == 0U) {
       out->brush_cycle = 1U;
@@ -736,21 +755,19 @@ void MotionStrategy_Update(const VisionData_t *vision,
       s_action_step = 3U;
     } else if (s_action_step == 3U &&
                s_state_ms >= COLLECT_BUCKET_DELAY_MS) {
+      /*
+       * 发后斗指令并立即转下一轮。滚刷已经走完、物块已被扫进来，所以这里
+       * 就是"收到一个"的真实节点，计数和搜索计时都在这一刻更新。
+       */
       out->bucket_cycle = 1U;
-      s_action_step = 4U;
-    } else if (s_action_step == 4U &&
-               ActuatorServos_IsBusy(ACTUATOR_SERVO_BUCKET)) {
-      s_action_step = 5U;
-    } else if (s_action_step == 5U &&
-               !ActuatorServos_IsBusy(ACTUATOR_SERVO_BUCKET)) {
       s_collected++;
-      /* 唯一的清零点：整套滚刷+后斗动作走完才算一次真实进度。下面的超时
-       * 分支不清零，那条路没收到东西。 */
+      /* 唯一的清零点：滚刷成功走完才算一次真实进度。下面的超时分支不清零，
+       * 那条路没收到东西。 */
       s_search_ms = 0U;
       Enter(MOTION_STATE_SEARCH_CONTINUE);
     }
-    if (s_state_ms >= BRUSH_TIMEOUT_MS + BUCKET_OUTBOUND_MS +
-                      BUCKET_RETURN_MS + COLLECT_BUCKET_DELAY_MS) {
+    /* 兜底只覆盖滚刷段：后斗已不占用本状态的时间。 */
+    if (s_state_ms >= BRUSH_TIMEOUT_MS + COLLECT_BUCKET_DELAY_MS) {
       Enter(MOTION_STATE_SEARCH_CONTINUE);
     }
     break;
@@ -762,28 +779,41 @@ void MotionStrategy_Update(const VisionData_t *vision,
         : MOTION_STATE_ROTATE_SEARCH);
     break;
 
-  case MOTION_STATE_HOME_PREPARE:
+  case MOTION_STATE_HOME_PREPARE: {
     /*
-     * 返航起步：锁定此刻朝向原点的方位角，并按当前距离算出直线段的终点。
+     * 返航起步：锁定此刻朝向原点的方位角，并按当前距离算出两道门。
      * 只走全程的 HOME_PARTIAL_RETURN_RATIO，把"剩下多少距离"存进
      * s_move_target_cm 当退出阈值；余下的路交给视觉找黑区，用它消掉里程计
      * 的累计误差。
      */
+    float dist = ImuOdometry_GetDistanceCm();
     Motion_StopOutput(out);
     ImuOdometry_BeginReturn();
-    s_move_target_cm = ImuOdometry_GetDistanceCm() *
-                       (1.0f - HOME_PARTIAL_RETURN_RATIO);
-    /* 返航全程让 OpenMV 处于黑区模式，看见就能随时交接。 */
+    s_move_target_cm = dist * (1.0f - HOME_PARTIAL_RETURN_RATIO);
+    s_home_vision_cm = dist * (1.0f - HOME_VISION_ENABLE_RATIO);
+    /*
+     * OpenMV 全程留在黑区模式，但起步一段不"认"——交接由 s_home_vision_on 单独
+     * 把关，过了 1/3 才解锁。这样这一段是纯里程计返航：朝锁定的方位角开，
+     * 看见黑区也不理，从而不会扎向对方的卸货区（场上两个黑区长得一样，
+     * OpenMV 分不出是谁的，而起步时车在远端，最容易先看见对方那个）。
+     *
+     * 为什么不干脆切回物块模式：那样等于让摄像头在返航途中去找物块，没有意义;
+     * 而且解锁点再切回黑区要等 OpenMV 重新稳定，白丢几帧，黑区到位帧 (A) 也
+     * 只在黑区模式下发。留在黑区模式、只拦"认不认"最省事。
+     * s_wall_black 照旧置 1，它决定各种兜底最终落到黑区搜索这条线上。
+     */
     s_black_target = 1U;
     s_wall_black = 1U;
+    s_home_vision_on = 0U;
     Enter(MOTION_STATE_HOME_FOLLOW);
     break;
+  }
 
   case MOTION_STATE_HOME_FOLLOW: {
     /*
      * 朝锁定的方位角直行，偏差大时先原地转（迟滞判据都在
-     * HomeTrajectory_GetReturnCommand 里）。全程盯着黑区。出路：
-     *   确认看见黑区                → 交给 BLACK_AREA_TRACK；
+     * HomeTrajectory_GetReturnCommand 里）。出路：
+     *   确认看见黑区                → 交给 BLACK_AREA_TRACK（仅 1/3 之后）；
      *   走完 3/4 或已进到 12cm 内   → BLACK_AREA_SEARCH 原地扫视；
      *   撞墙                        → 退一小段 + 方位角右旋 8°，回本状态继续
      *                                 往前拱；墙还在就再来一档，如此反复；
@@ -792,6 +822,17 @@ void MotionStrategy_Update(const VisionData_t *vision,
     float linear = 0.0f;
     float angular = 0.0f;
     uint8_t arrived = ImuOdometry_GetReturnCommand(heading, &linear, &angular);
+
+    /*
+     * 走过 HOME_VISION_ENABLE_RATIO 之后才解锁视觉交接；在此之前纯靠里程计
+     * 朝家开，看见黑区也不理。
+     * 只升不降：遇墙退避会把车往后推、剩余距离回涨，若跟着回锁就会在门附近
+     * 反复上锁解锁，交接确认计时永远攒不满。
+     */
+    if (!s_home_vision_on &&
+        ImuOdometry_GetDistanceCm() <= s_home_vision_cm) {
+      s_home_vision_on = 1U;
+    }
 
     if (s_home_seen_ms >= HOME_VISION_CONFIRM_MS) {
       /* 计时能攒满就说明这一刻 wanted_detected 为真，s_missing_ms 已是 0。 */
@@ -874,9 +915,10 @@ void MotionStrategy_Update(const VisionData_t *vision,
 
   case MOTION_STATE_UNLOADING:
     /*
-     * 开门 → 升降 → 前进 0.5s → 升降 → 关门 → 左前方弧线开出黑区。
-     * 门只开关一次，全程保持打开：物块常卡在斗底或门边一次滑不出去，落斗再
-     * 升起的冲击能把它抖松，而抖动只有在门开着时才有意义。
+     * 开门 → 升降 → 前进 0.5s → 升降 → 左前方弧线开出黑区 → 关门。
+     * 门只开关一次，从开门一直开到驶出黑区之后：物块常卡在斗底或门边一次滑
+     * 不出去，落斗再升起的冲击能把它抖松，而抖动只有在门开着时才有意义；
+     * 开出黑区那一段的颠簸同理，所以关门放在最后而不是开出之前。
      * 单轮升降之内不留停留时间，斗到位即反向；两轮之间挪一小段，避免两次都
      * 卸在同一点、物块堆起来互相挡住出口。
      */
@@ -924,28 +966,30 @@ void MotionStrategy_Update(const VisionData_t *vision,
         Motion_Line(UNLOAD_EXIT_SPEED_CM_S, out);
       }
     } else if (s_action_step == 7U) {
-      if (ActuatorServos_SetAngle(ACTUATOR_SERVO_DOOR, DOOR_START_DEG)) {
-        s_action_step = 8U;
-        s_state_ms = 0U;
-      }
-    } else if (s_action_step == 8U && s_state_ms >= BUCKET_DOOR_CLOSE_MS) {
-      s_action_step = 9U;
-      s_state_ms = 0U;
-    } else if (s_action_step == 9U) {
       /*
        * 沿弧线朝左前方开出黑区：车尾还压在卸货区上，原地起转会把刚倒出来的
-       * 物块扫散。带 30°左偏是为了让下一轮搜索的起始朝向与上一轮错开。
+       * 物块扫散。带 45°左偏是为了让下一轮搜索的起始朝向与上一轮错开。
+       * 这一段门仍然开着：卡在斗底或门边的物块能借开出时的颠簸继续掉出来，
+       * 出了黑区再关，免得把没抖出来的物块一路带走。
        */
       if (s_state_ms >= UNLOAD_EXIT_FORWARD_MS) {
         Motion_StopOutput(out);
-        s_black_target = 0U;
-        /* 新一轮的久搜计时从这里重新起算。 */
-        s_search_ms = 0U;
-        Enter(MOTION_STATE_INIT);
+        s_action_step = 8U;
+        s_state_ms = 0U;
       } else {
         Motion_Drive(UNLOAD_EXIT_SPEED_CM_S,
                      DEG_TO_RAD(UNLOAD_EXIT_TURN_DEG_S), out);
       }
+    } else if (s_action_step == 8U) {
+      if (ActuatorServos_SetAngle(ACTUATOR_SERVO_DOOR, DOOR_START_DEG)) {
+        s_action_step = 9U;
+        s_state_ms = 0U;
+      }
+    } else if (s_action_step == 9U && s_state_ms >= BUCKET_DOOR_CLOSE_MS) {
+      s_black_target = 0U;
+      /* 新一轮的久搜计时从这里重新起算。 */
+      s_search_ms = 0U;
+      Enter(MOTION_STATE_INIT);
     }
     break;
 
