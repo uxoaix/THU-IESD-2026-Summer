@@ -23,7 +23,7 @@ BLACK_TYPE = 3
 
 # -1 = wait for STM32 command, 0 = red/yellow blocks, 1 = black unload area.
 # Starting idle ensures target locking begins only after an explicit M,0.
-detection_mode = 0
+detection_mode = 1
 
 # Latched wall flag. Kept across frames so the enter/exit thresholds
 # can act as hysteresis instead of both being compared every frame.
@@ -102,6 +102,29 @@ def largest_black_region(img, roi):
         if largest is None or blob.pixels > largest.pixels:
             largest = blob
     return largest
+
+
+def min_corners_info(blob):
+    """Return min_corners and its average center, or fallback to blob center."""
+    try:
+        corners = blob.min_corners
+        if callable(corners):
+            corners = corners()
+        if len(corners) == 4:
+            center_x = sum(point[0] for point in corners) // 4
+            center_y = sum(point[1] for point in corners) // 4
+            return corners, center_x, center_y
+    except Exception:
+        pass
+    return None, blob.cx, blob.cy
+
+
+def draw_min_corners(img, corners, color):
+    for corner_index in range(4):
+        next_index = (corner_index + 1) % 4
+        x1, y1 = corners[corner_index]
+        x2, y2 = corners[next_index]
+        img.draw_line((x1, y1, x2, y2), color=color, thickness=2)
 
 
 def expanded_blob_roi(blob, margin, image_width, image_height):
@@ -266,7 +289,7 @@ color_configs = (
 )
 
 # Black unload area. Threshold must be re-tuned on the real field.
-BLACK_CONFIG = (BLACK_TYPE, "BLACK", (0, 45, -15, 18, -21, 10), (0, 0, 255), 400.0)
+BLACK_CONFIG = (BLACK_TYPE, "BLACK", (0, 50, -15, 18, -21, 10), (0, 0, 255), 400.0)
 GROUND_THRESHOLD = (77, 100, -48, 23, -14, 23)
 # The area is a large floor region, so it needs a bigger blob and merging.
 BLACK_PIXELS_THRESHOLD = 300
@@ -545,9 +568,11 @@ while True:
     h = blob.h
     cx = blob.cx
     cy = blob.cy
+    black_corners = None
 
     if object_type == BLACK_TYPE:
-        cx = cx + 10
+        black_corners, cx, cy = min_corners_info(blob)
+        cx = cx - 5
         # Use actual threshold-matched pixels, not the axis-aligned w*h box.
         # This excludes non-black background inside a slanted bounding box.
         black_fill_pct = min(
@@ -569,7 +594,9 @@ while True:
         distance_mm = (FOCAL_LENGTH_PX * known_width_mm) / w
         distance_cm = int(distance_mm / 10.0)
 
-    if object_type != BLACK_TYPE:
+    if object_type == BLACK_TYPE and black_corners is not None:
+        draw_min_corners(img, black_corners, box_color)
+    elif object_type != BLACK_TYPE:
         img.draw_rectangle(blob.rect, color=box_color, thickness=2)
     img.draw_cross((cx, cy), color=box_color, size=5, thickness=2)
     label_y = max(y - 12, 0)
