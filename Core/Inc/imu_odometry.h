@@ -11,7 +11,9 @@
 void ImuOdometry_Init(void);
 void ImuOdometry_Update(const WheelFeedback_t *wheels, float dt_s);
 
-/* 当前位置设为原点 (0,0)，航向归零。开机初始化与蓝牙 SET_HOME 调用。
+/* 建立坐标系，航向归零；原点定在车右侧 HOME_START_OFFSET_RIGHT_CM 处（黑区
+ * 不在上电位置上），所以车的初始坐标是 (0, +偏移) 而不是 (0,0)。
+ * 开机初始化与蓝牙 SET_HOME 调用。
  * 航向归零会切断绝对航向的连续性，任务途中不要用。 */
 void ImuOdometry_SetHome(void);
 /* 只把 (0,0) 挪到当前位置，不动航向。卸货时标记下一轮原点用。 */

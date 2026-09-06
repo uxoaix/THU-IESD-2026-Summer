@@ -21,11 +21,16 @@ void ImuOdometry_Update(const WheelFeedback_t *wheels, float dt_s)
   }
 }
 
-/* 建立坐标系: 航向清零 + 当前位置设为 (0,0)。开机初始化和蓝牙 SET_HOME 用。 */
+/*
+ * 建立坐标系: 航向清零 + 把原点定在车右侧 HOME_START_OFFSET_RIGHT_CM 处。
+ * 开机初始化和蓝牙 SET_HOME 用。原点不取车脚下, 是因为要返回的黑区并不在
+ * 上电位置上, 见 motion_config.h 里 HOME_START_OFFSET_RIGHT_CM 的说明。
+ */
 void ImuOdometry_SetHome(void)
 {
   SensorFusion_ResetHeading();
-  HomeTrajectory_SetOrigin(SensorFusion_GetHeading());
+  HomeTrajectory_SetOrigin(SensorFusion_GetHeading(),
+                           HOME_START_OFFSET_RIGHT_CM);
 }
 
 /*
@@ -36,7 +41,8 @@ void ImuOdometry_SetHome(void)
  */
 void ImuOdometry_MoveOriginHere(void)
 {
-  HomeTrajectory_SetOrigin(SensorFusion_GetHeading());
+  /* 偏移传 0: 此刻车就在真实卸货点上, 不像开机那次需要猜黑区在哪。 */
+  HomeTrajectory_SetOrigin(SensorFusion_GetHeading(), 0.0f);
 }
 
 /* 返航直线段: 转发给 home_trajectory, 见那边的说明。 */

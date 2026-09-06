@@ -35,8 +35,10 @@ static MotionState_t s_backoff_return_state;
 static uint32_t s_wall_clear_ms;
 /* 黑区到位: 连续报到位的时长，A 帧本身无迟滞，靠这个去抖。 */
 static uint32_t s_arrive_confirm_ms;
-/* 已完成的升降卸货轮数，UNLOADING 内部 s_action_step 在 2~5 之间循环。 */
+/* 已完成的升降卸货轮数，UNLOADING 内部 s_action_step 在 2~9 之间循环。 */
 static uint8_t s_unload_cycles;
+/* 本轮升降在顶端已走过的抖动小行程数，奇偶决定下一次摆向哪一边。 */
+static uint8_t s_unload_shakes;
 /* 贴墙纠缠累计计时，见 motion_config.h §12.2 WALL_STRUGGLE_TIMEOUT_MS。 */
 static uint32_t s_wall_struggle_ms;
 static uint8_t s_wall_struggle_active;
@@ -343,6 +345,7 @@ void MotionStrategy_Init(void)
   s_wall_clear_ms = 0U;
   s_arrive_confirm_ms = 0U;
   s_unload_cycles = 0U;
+  s_unload_shakes = 0U;
   s_wall_struggle_ms = 0U;
   s_wall_struggle_active = 0U;
   s_search_ms = 0U;
@@ -792,10 +795,11 @@ void MotionStrategy_Update(const VisionData_t *vision,
     s_move_target_cm = dist * (1.0f - HOME_PARTIAL_RETURN_RATIO);
     s_home_vision_cm = dist * (1.0f - HOME_VISION_ENABLE_RATIO);
     /*
-     * OpenMV 全程留在黑区模式，但起步一段不"认"——交接由 s_home_vision_on 单独
-     * 把关，过了 1/3 才解锁。这样这一段是纯里程计返航：朝锁定的方位角开，
-     * 看见黑区也不理，从而不会扎向对方的卸货区（场上两个黑区长得一样，
-     * OpenMV 分不出是谁的，而起步时车在远端，最容易先看见对方那个）。
+     * OpenMV 全程留在黑区模式，但起步 5% 不"认"——交接由 s_home_vision_on 单独
+     * 把关。这一小段是纯里程计返航，看见黑区也不理：刚出发时车还压在上一轮的
+     * 卸货点上，脚下就是黑区，不拦会立刻自我触发一次交接。
+     * （这道门原本还兼顾"别扎向对方的卸货区"——场上两个黑区长得一样，OpenMV
+     * 分不出是谁的——所以曾设到 1/3、1/2；现在为了尽早锁定自己家降到 5%。）
      *
      * 为什么不干脆切回物块模式：那样等于让摄像头在返航途中去找物块，没有意义;
      * 而且解锁点再切回黑区要等 OpenMV 重新稳定，白丢几帧，黑区到位帧 (A) 也
@@ -813,8 +817,8 @@ void MotionStrategy_Update(const VisionData_t *vision,
     /*
      * 朝锁定的方位角直行，偏差大时先原地转（迟滞判据都在
      * HomeTrajectory_GetReturnCommand 里）。出路：
-     *   确认看见黑区                → 交给 BLACK_AREA_TRACK（仅 1/3 之后）；
-     *   走完 3/4 或已进到 12cm 内   → BLACK_AREA_SEARCH 原地扫视；
+     *   确认看见黑区                → 交给 BLACK_AREA_TRACK（仅 5% 之后）；
+     *   走完 1/2 或已进到 12cm 内   → BLACK_AREA_SEARCH 原地扫视；
      *   撞墙                        → 退一小段 + 方位角右旋 8°，回本状态继续
      *                                 往前拱；墙还在就再来一档，如此反复；
      *   贴墙累计到点 / 兜底超时     → BLACK_AREA_SEARCH。
@@ -851,6 +855,15 @@ void MotionStrategy_Update(const VisionData_t *vision,
        * 后续的换位/重扫都会留在黑区这条线上。
        */
       Motion_StopOutput(out);
+      /*
+       * 必须清 s_missing_ms：它是全局累加的"距上次看见目标多久"，返航整段
+       * 都看不见黑区，到这里早已远超 BLACK_SEARCH_TIMEOUT_MS(12.5s)。而
+       * BLACK_AREA_SEARCH 正是拿它当"已转完一圈"的判据，不清零就会在第一个
+       * 周期直接判定扫视失败，拿着只有一个采样点的方向表开环冲 120cm，
+       * 等于把"留最后 1/4 给视觉"整个绕过去。
+       * 同 INIT 进 ROTATE_SEARCH 前的清零，以及 ResumeSearch() 里的那一句。
+       */
+      s_missing_ms = 0U;
       Enter(MOTION_STATE_BLACK_AREA_SEARCH);
     } else if (BackoffIfWallSeen(vwall, out)) {
       /* 已转入退避，本周期不再输出其他动作。 */
@@ -915,12 +928,14 @@ void MotionStrategy_Update(const VisionData_t *vision,
 
   case MOTION_STATE_UNLOADING:
     /*
-     * 开门 → 升降 → 前进 0.5s → 升降 → 左前方弧线开出黑区 → 关门。
+     * 开门 → 升斗 → 等1s → 振颤 → 前进 0.5s → 等1s → 振颤 → 落斗
+     *   → 左前弧线开出黑区 → 关门。
      * 门只开关一次，从开门一直开到驶出黑区之后：物块常卡在斗底或门边一次滑
-     * 不出去，落斗再升起的冲击能把它抖松，而抖动只有在门开着时才有意义；
+     * 不出去，反复的启停冲击才能把它抖松，而抖动只有在门开着时才有意义；
      * 开出黑区那一段的颠簸同理，所以关门放在最后而不是开出之前。
-     * 单轮升降之内不留停留时间，斗到位即反向；两轮之间挪一小段，避免两次都
-     * 卸在同一点、物块堆起来互相挡住出口。
+     * 只升一次、只落一次：中间两轮振颤全在抬起状态下进行（0↔110 全行程快速
+     * 来回下指令，见 BUCKET_SHAKE_*），斗不必真的落到底再抬。
+     * 两轮之间挪一小段，避免两次都卸在同一点、物块堆起来互相挡住出口。
      */
     Motion_StopOutput(out);
     if (s_action_step == 0U) {
@@ -937,19 +952,35 @@ void MotionStrategy_Update(const VisionData_t *vision,
         s_state_ms = 0U;
       }
     } else if (s_action_step == 3U && s_state_ms >= BUCKET_LIFT_DURATION_MS) {
+      s_unload_shakes = 0U;
       s_action_step = 4U;
     } else if (s_action_step == 4U) {
-      if (ActuatorServos_SetAngle(ACTUATOR_SERVO_BUCKET, BUCKET_START_DEG)) {
+      /*
+       * 振颤一程：偶数次给 BUCKET_START_DEG，奇数次给 BUCKET_END_DEG。
+       * 等待远短于全行程耗时，舵机走不到目标就被下一个反向指令打断，斗在
+       * 中段大幅来回颤，见 BUCKET_SHAKE_STEP_MS 的说明。
+       * 用奇偶驱动而不是给每程各排一对 step，行程数只由 BUCKET_SHAKE_MOVES
+       * 决定，改次数不用动状态机。
+       */
+      uint16_t shake_deg = (uint16_t)((s_unload_shakes & 1U) ? BUCKET_END_DEG
+                                                             : BUCKET_START_DEG);
+      if (ActuatorServos_SetAngle(ACTUATOR_SERVO_BUCKET, shake_deg)) {
         s_action_step = 5U;
         s_state_ms = 0U;
       }
-    } else if (s_action_step == 5U && s_state_ms >= BUCKET_LOWER_DURATION_MS) {
-      s_unload_cycles++;
-      /* 还有下一轮就先挪一小段(step6)，卸完了就直接关门(step7)。 */
-      s_action_step = (s_unload_cycles < UNLOAD_REPEAT_COUNT) ? 6U : 7U;
+    } else if (s_action_step == 5U && s_state_ms >= BUCKET_SHAKE_STEP_MS) {
+      s_unload_shakes++;
+      if (s_unload_shakes < BUCKET_SHAKE_MOVES) {
+        s_action_step = 4U;
+      } else {
+        /* MOVES 是偶数，一轮颤完斗停在抬起那一侧，落斗留到最后统一做。 */
+        s_unload_cycles++;
+        /* 还有下一轮就先挪一小段(step6)，颤完了就落斗(step8)。 */
+        s_action_step = (s_unload_cycles < UNLOAD_REPEAT_COUNT) ? 6U : 8U;
+      }
       s_state_ms = 0U;
     } else if (s_action_step == 6U) {
-      /* 两轮升降之间挪位，让第二轮卸在稍微错开的位置。 */
+      /* 两轮振颤之间挪位，让第二轮卸在稍微错开的位置；斗保持抬起。 */
       if (s_state_ms >= UNLOAD_MID_FORWARD_MS) {
         Motion_StopOutput(out);
         if (s_unload_cycles == 1U) {
@@ -961,11 +992,28 @@ void MotionStrategy_Update(const VisionData_t *vision,
            */
           ImuOdometry_MoveOriginHere();
         }
-        s_action_step = 2U;
+        s_action_step = 7U;
+        s_state_ms = 0U;
       } else {
         Motion_Line(UNLOAD_EXIT_SPEED_CM_S, out);
       }
-    } else if (s_action_step == 7U) {
+    } else if (s_action_step == 7U && s_state_ms >= BUCKET_LIFT_DURATION_MS) {
+      /*
+       * 第二轮振颤之前先等斗真正抬到位。上一轮最后一条指令是 110°，但舵机
+       * 没走完就被打断过，此刻实际停在中段；不等它到位就开颤，起点会偏低、
+       * 幅度缩水。挪位那 0.5s 只够走一部分，所以这里再补一个整程时间。
+       */
+      s_unload_shakes = 0U;
+      s_action_step = 4U;
+    } else if (s_action_step == 8U) {
+      if (ActuatorServos_SetAngle(ACTUATOR_SERVO_BUCKET, BUCKET_START_DEG)) {
+        s_action_step = 9U;
+        s_state_ms = 0U;
+      }
+    } else if (s_action_step == 9U && s_state_ms >= BUCKET_LOWER_DURATION_MS) {
+      s_action_step = 10U;
+      s_state_ms = 0U;
+    } else if (s_action_step == 10U) {
       /*
        * 沿弧线朝左前方开出黑区：车尾还压在卸货区上，原地起转会把刚倒出来的
        * 物块扫散。带 45°左偏是为了让下一轮搜索的起始朝向与上一轮错开。
@@ -974,18 +1022,18 @@ void MotionStrategy_Update(const VisionData_t *vision,
        */
       if (s_state_ms >= UNLOAD_EXIT_FORWARD_MS) {
         Motion_StopOutput(out);
-        s_action_step = 8U;
+        s_action_step = 11U;
         s_state_ms = 0U;
       } else {
         Motion_Drive(UNLOAD_EXIT_SPEED_CM_S,
                      DEG_TO_RAD(UNLOAD_EXIT_TURN_DEG_S), out);
       }
-    } else if (s_action_step == 8U) {
+    } else if (s_action_step == 11U) {
       if (ActuatorServos_SetAngle(ACTUATOR_SERVO_DOOR, DOOR_START_DEG)) {
-        s_action_step = 9U;
+        s_action_step = 12U;
         s_state_ms = 0U;
       }
-    } else if (s_action_step == 9U && s_state_ms >= BUCKET_DOOR_CLOSE_MS) {
+    } else if (s_action_step == 12U && s_state_ms >= BUCKET_DOOR_CLOSE_MS) {
       s_black_target = 0U;
       /* 新一轮的久搜计时从这里重新起算。 */
       s_search_ms = 0U;

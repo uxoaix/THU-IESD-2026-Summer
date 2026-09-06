@@ -64,10 +64,15 @@ void HomeTrajectory_Init(void)
   s_rotate_in_place = 0U;
 }
 
-void HomeTrajectory_SetOrigin(float heading_rad)
+/*
+ * 建立坐标系。right_offset_cm = 原点相对车当前位置的右向偏移:
+ * 传 0 就是"车脚下即原点"; 传正值表示原点在车右侧那么远, 于是车的坐标记成
+ * (0, +offset) —— 因为 +y 是设系航向的左侧, 原点在右就等于车在原点的左边。
+ */
+void HomeTrajectory_SetOrigin(float heading_rad, float right_offset_cm)
 {
   s_x_cm = 0.0f;
-  s_y_cm = 0.0f;
+  s_y_cm = right_offset_cm;
   s_home_heading = heading_rad;
   s_prev_relative_heading = 0.0f;
   s_origin_set = 1U;

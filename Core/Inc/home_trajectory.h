@@ -4,7 +4,8 @@
 #include <stdint.h>
 
 void HomeTrajectory_Init(void);
-void HomeTrajectory_SetOrigin(float heading_rad);
+/* right_offset_cm: 原点相对车当前位置的右向偏移, 0 = 车脚下即原点。 */
+void HomeTrajectory_SetOrigin(float heading_rad, float right_offset_cm);
 uint8_t HomeTrajectory_IsOriginSet(void);
 void HomeTrajectory_Update(float linear_cm_s, float heading_rad, float dt_s);
 
