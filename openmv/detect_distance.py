@@ -1,5 +1,4 @@
 # OpenMV -> STM32  USART2 visual transmission test.
-# Frame: V,color,cx,cy,distance_cm\n
 # color: 0=none, 1=red, 2=yellow, 3=black unload area.
 # STM32 command: M,0\n=block mode, M,1\n=black unload area mode.
 # Wall frame: W,state,fill_pct\n; state: 0=clear, 1=too close.
@@ -148,6 +147,23 @@ def count_threshold_pixels(img, sample_roi, threshold):
     return matched_pixels
 
 
+def count_black_pixels_in_roi(img, sample_roi):
+    return count_threshold_pixels(img, sample_roi, BLACK_CONFIG[2])
+
+
+def black_cx_offset_from_black_balance(img):
+    left_roi = (0, 0, IMAGE_WIDTH // 2, IMAGE_HEIGHT)
+    right_roi = (IMAGE_WIDTH // 2, 0, IMAGE_WIDTH - (IMAGE_WIDTH // 2), IMAGE_HEIGHT)
+    left_black_pixels = count_black_pixels_in_roi(img, left_roi)
+    right_black_pixels = count_black_pixels_in_roi(img, right_roi)
+
+    if left_black_pixels > right_black_pixels:
+        return BLACK_CX_OFFSET_PX, left_black_pixels, right_black_pixels
+    if right_black_pixels > left_black_pixels:
+        return -BLACK_CX_OFFSET_PX, left_black_pixels, right_black_pixels
+    return 0, left_black_pixels, right_black_pixels
+
+
 def ring_threshold_pixels(img, blob, sample_roi, threshold):
     outer_pixels = count_threshold_pixels(img, sample_roi, threshold)
     inner_roi = (blob.x, blob.y, blob.w, blob.h)
@@ -294,6 +310,7 @@ GROUND_THRESHOLD = (77, 100, -48, 23, -14, 23)
 # The area is a large floor region, so it needs a bigger blob and merging.
 BLACK_PIXELS_THRESHOLD = 300
 BLACK_ARRIVAL_FILL_PCT = 12
+BLACK_CX_OFFSET_PX = 5
 # Red/yellow exclusion: inspect a configurable ring around every candidate.
 BLACK_SAMPLE_MARGIN = 5
 BLACK_SAMPLE_MIN_PIXELS = 2
@@ -572,7 +589,8 @@ while True:
 
     if object_type == BLACK_TYPE:
         black_corners, cx, cy = min_corners_info(blob)
-        cx = cx - 5
+        cx_offset, left_black_pixels, right_black_pixels = black_cx_offset_from_black_balance(img)
+        cx = cx + cx_offset
         # Use actual threshold-matched pixels, not the axis-aligned w*h box.
         # This excludes non-black background inside a slanted bounding box.
         black_fill_pct = min(
@@ -581,7 +599,15 @@ while True:
         )
         black_arrived = 1 if black_fill_pct > BLACK_ARRIVAL_FILL_PCT else 0
         send_arrival(black_arrived, black_fill_pct)
-        print("BLACK", black_arrived, black_fill_pct)
+        print(
+            "BLACK",
+            black_arrived,
+            black_fill_pct,
+            "black L/R/offset",
+            left_black_pixels,
+            right_black_pixels,
+            cx_offset,
+        )
         # A floor region fills the frame when close, so its width saturates.
         # Use the gap between its near edge and the image bottom instead:
         # the gap shrinks to zero as the car drives onto the area.
