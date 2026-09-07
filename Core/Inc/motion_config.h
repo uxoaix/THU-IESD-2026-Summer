@@ -127,6 +127,23 @@ typedef struct {
 
 /* 7. 状态机周期与超时 */
 #define MOTION_PERIOD_MS                 50U
+/*
+ * 扫视阶段发现目标的去抖: 要求 wanted_detected 连续为真这么久才转 PRE_CENTERING,
+ * 不再一帧就跳 (约 6 个 MOTION_PERIOD_MS 周期)。
+ *
+ * 为什么要加: ROTATE_SEARCH 恒为右转, 而 PRE_CENTERING 的原地拧由模糊控制给方向、
+ * 可左可右; 只要 OpenMV 闪跳一帧, 车就"看见→往左拧→丢了→往右扫→又看见", 表现为
+ * 一会儿左一会儿右。更麻烦的是回搜索走的是 ResumeSearch() → Enter(), 会把
+ * s_action_step 清 0, 于是转圈基准和扫视方向表一起重置, 350° 的整圈判据永远攒不满,
+ * 车原地磨到 SEARCH_NO_TARGET_TIMEOUT_MS 才肯换位。
+ *
+ * 计时是全局的 (s_seen_ms, 与 s_missing_ms 互补), 所以目标在上一个状态里已经连续
+ * 可见时不会再白等一次; 但 ResumeSearch() 会清零, 让 PRE_CENTERING 因 2s 超时退出后
+ * 至少先扫 300ms 再重试, 免得贴着超时反复弹。
+ * 代价: 目标出现到开始对准多 300ms, 期间扫视又转过约 10°, 目标会更偏离画面中心一点,
+ * 这个偏差由 PRE_CENTERING 自己拧回来。太大 (比如 1s) 会让快速掠过视野的目标错过。
+ */
+#define SEARCH_DETECT_CONFIRM_MS         300U
 #define SEARCH_NO_TARGET_TIMEOUT_MS       10000U
 /*
  * 黑区原地扫视的时限, 同时决定扫视方向表能覆盖多少方向: 以
@@ -138,10 +155,11 @@ typedef struct {
  * 找物块阶段的总兜底: 距上次"滚刷收集成功"超过这么久就放弃本轮, 带着已经
  * 收到的直接返航卸货 (收几个算几个)。
  *
- * 判据是收集成功而不是看见物块: 只有 BRUSH_COLLECT 走完整套滚刷+后斗动作、
+ * 判据是收集成功而不是看见物块: 只有 BRUSH_COLLECT 滚刷去程到位、
  * s_collected 真的加一时才清零。按"看见"清零挡不住两种常见卡死 —— 车盯着
  * 一个够不到的物块反复对准, 或者每次追踪都在最后一刻丢失目标; 这两种情况下
  * 视觉一直有目标, 计时被无限推迟, 车能在原地耗完整场时间。
+ * 后斗升降在滚刷整段 0→180→0 结束后才后台启动, 不参与本计时清零点。
  *
  * 也因此这个计时在收集阶段全程累加 (含 PRE_CENTERING / TARGET_TRACKING /
  * FINAL_APPROACH / BRUSH_COLLECT), 不像只在搜索态计时那样漏掉上面那类卡死。
@@ -204,8 +222,39 @@ typedef struct {
 /* 黑区到位判据: 由 OpenMV 的 A 帧直接给出 (见 §5.1), STM32 不再自己算距离。
  * 阈值 BLACK_ARRIVAL_FILL_PCT 在 detect_distance.py 里, 用遥测 arv_pct 标定。
  * 这里只做一层去抖: A 帧没有迟滞, 阴影和黑区连成一片时单帧占比会突跳,
- * 所以要求连续这么久都报到位才掉头。约 4 帧, 不会明显滞后。 */
-#define BLACK_ARRIVE_CONFIRM_MS          200U
+ * 所以要求连续这么久都报到位才允许考虑掉头。150ms 约 3 帧, 也正好是 3 个
+ * MOTION_PERIOD_MS 周期; 再往下压到一两帧就等于没有去抖了。
+ *
+ * 掉头还要求水平对准误差 |GetAlignmentError(x_offset)| ≤ BLACK_TURN_ALIGN_MAX_PX
+ * (已扣摄像头安装偏置)。到位了但对不齐时先原地拧, 拧进门限再转 HOME_TURN_AROUND,
+ * 否则车尾歪着卸货, 物块容易甩出黑区。
+ *
+ * 对准同样要连续 BLACK_TURN_ALIGN_CONFIRM_MS 才算数, 不能只看一帧。原地拧的
+ * 最小转速是 30°/s (静摩擦下限), 一个 50ms 周期就走约 5px; 只判瞬时值的话车
+ * 一跨进门限就停下掉头, 实际停位卡在门限边缘, 等于"勉强及格就掉头"。要求连续
+ * 满足会让对准继续把误差压到更小再稳住, 拿到的是真居中而不是擦边。
+ * 与到位取同一个 150ms: 两者都是 3 个周期, 意味着"至少经历 3 次修正后仍在门限
+ * 内"。压到 100ms(2 周期) 以下就接近单周期步进 5px, 挡不住边缘抖动。
+ *
+ * 计时在整个 BLACK_AREA_TRACK 里累加, 不是等到位之后才开始: 边走边追时车本来
+ * 就在持续对中, 到位那一刻计时通常已经攒满, 不会白等一次 CONFIRM; 只有真歪了
+ * 才需要拧到位再稳住这段时间。误差一超门限立即清零。
+ *
+ * 【门限必须大于 TRACKING_DEADZONE_PX(8), 且留出余量】原地拧用的是同一套模糊
+ * 控制, 它在 ±8px 内返回 0, 经 ApplyTurnFloor 仍是 0 —— 车在死区内就停转。
+ * 门限一旦小于死区 (例如取 5), 误差落在 6~8px 时车既不转、又满足不了门限,
+ * 而本状态没有超时、黑区还在视野里 (目标不丢, 走不到 ResumeSearch), 于是永久
+ * 停在这里。所以门限要把整个死区包进去。
+ *
+ *
+ *
+ * 15 而不是刚好 12: 实际停位由死区决定 (总落在 ±8 内), 门限只负责"别比死区还
+ * 紧", 调大不会让对准变差; 留 7px 余量是给单周期 5px 的步进和抖动, 免得误差在
+ * 门限边缘反复进出把去抖计时清零。
+ * 想要比 ±8 更准的对准, 只能调小 TRACKING_DEADZONE_PX, 但那会影响所有物块追踪。 */
+#define BLACK_ARRIVE_CONFIRM_MS          150U   /* 200 */
+#define BLACK_TURN_ALIGN_MAX_PX          15
+#define BLACK_TURN_ALIGN_CONFIRM_MS      150U   /* 200 */
 #define TRACKING_SLOW_RATIO              1.0f
 #define TRACKING_CORRECTION_GAIN         1.0f  /* 行进修正不过度放大，尽量保持两侧前进 */
 #define TRACKING_MIN_LINEAR_RATIO        0.60f /* 大偏差时仍保留60%前进速度 */
@@ -348,7 +397,7 @@ typedef struct {
 #define HOME_TURN_AROUND_TIMEOUT_MS      10000U
 /* 掉头后再倒一段: 车尾(后斗/门)此时朝着黑区, 多退一点能把卸货点从黑区
  * 边缘挪到中间, 免得物块滚出区外。车尾没有传感器, 只能用固定时长限量。
- * 3.0s × 17.25cm/s ≈ 52cm, 全程开环倒车, 车尾顶到墙也不会被察觉。 */
+ * 2.5s × 17.25cm/s ≈ 43cm, 全程开环倒车, 车尾顶到墙也不会被察觉。 */
 #define HOME_BACKUP_DURATION_MS          2500U
 #define HOME_BACKUP_SPEED_CM_S           17.25f /* 15.0 */
 
@@ -410,7 +459,7 @@ typedef struct {
  *   途中撞墙不回本状态重走: 退避完直接回原地扫视重新挑方向 (见 12.2),
  *   所以这段距离只在"一路无墙"时才会真的走满。 */
 #define SEARCH_RELOCATE_DIST_CM          120.0f /* 60.0 */
-#define SEARCH_RELOCATE_SPEED_CM_S       23.0f  /* 20.0 */
+#define SEARCH_RELOCATE_SPEED_CM_S       35.0f  /* 20.0 */
 /*
  * 超时只是里程计失效时的兜底, 必须留足于"正常走完全程"所需的时间, 否则
  * 距离判据永远轮不到、每次换位都被超时截断: 120cm / 23cm/s ≈ 5.2s, 加上
@@ -473,7 +522,7 @@ typedef struct {
  * 一次只偏 8°, 偏完继续往前拱; 墙还在就再触发一次, 8° 一档地蹭出去。整个过程
  * 里 OpenMV 一直是黑区模式, 看见黑区随时转 BLACK_AREA_TRACK 走后续流程。
  * 17.25cm/s × 0.8s ≈ 后退 14cm。
- * 为什么偏这么小: 大角度一档就把车头甩离原航线, 走完 3/4 的落点偏差大; 8° 是
+ * 为什么偏这么小: 大角度一档就把车头甩离原航线, 走完一半的落点偏差大; 8° 是
  * "尽量不偏离回家方向"和"能绕开墙"之间的折中, 代价是绕一面正面墙要十来档。
  * 累计兜底改用 HOME_WALL_GIVEUP_MS, 不是 WALL_STRUGGLE_TIMEOUT_MS, 原因见下。
  */
@@ -490,7 +539,7 @@ typedef struct {
  * 算进去, 一档实际吃掉 1.5~2s, 10s 只够攒 40° 左右 —— 车还顶在墙上就被判成
  * 卡死, 8° 一档的绕行根本走不完。
  *
- * 这个兜底不能省: 一直 8° 转下去总会转到背离家的方向, 那时"走完 3/4"的正常
+ * 这个兜底不能省: 一直 8° 转下去总会转到背离家的方向, 那时"走完一半"的正常
  * 出口永远等不到 (离原点的距离不减反增), 没有它车会顺着新方位角一路开走。
  * 30s 按上面的节奏够偏 120° 以上, 正面墙和场地角都够用。到点就放弃剩下的
  * 返航距离, 就地转 BLACK_AREA_SEARCH 原地扫黑区。
@@ -508,15 +557,12 @@ typedef struct {
 #define WALL_STRUGGLE_TIMEOUT_MS         10000U
 
 /* 13. 滚刷控制参数
- *   BRUSH_COLLECT 只等滚刷走完 (约 2s) 就转下一轮搜索; 收集用的后斗升降是
- *   "发指令即走", 由 ActuatorServos_Run 在后台跑完, 与下一轮搜索并行, 所以
- *   本阶段不再包含 BUCKET_OUTBOUND/RETURN_MS 那 2s。
- *   注意别把 DELAY 调到很大: 它是留在 BRUSH_COLLECT 里干等的, 不像升降本身
- *   能被并行吃掉。 */
+ *   时序: 滚刷 0→180 一到就进 SEARCH_CONTINUE (回程 180→0 在后台跑);
+ *   整段 0→180→0 结束后再触发后斗升降; 后斗未落回 IDLE 前不进入下一次
+ *   BRUSH_COLLECT (FINAL_APPROACH 末与 BRUSH_COLLECT 入口双重闸门)。
+ *   超时只罩滚刷去程: 去程约 BRUSH_OUTBOUND_MS, 给足余量防卡死。 */
 #define BRUSH_ROTATE_DURATION_MS         (BRUSH_OUTBOUND_MS + BRUSH_RETURN_MS)
-#define BRUSH_TIMEOUT_MS                 3500U     /* 滚刷动作超时保护 */
-/* 滚刷完成后隔这么久再发后斗指令, 避免两个舵机同时启动的冲击电流。 */
-#define COLLECT_BUCKET_DELAY_MS          150U
+#define BRUSH_TIMEOUT_MS                 2500U     /* 滚刷去程超时保护 */
 
 /* 14. 后斗卸载参数
  *   序列: 开门 → 升斗 → 等1s → 振颤 → 前进 0.5s → 等1s → 振颤 → 落斗
@@ -536,8 +582,8 @@ typedef struct {
 /* 只等舵机走完行程, 不额外停留; 两个值分别等于 BUCKET_OUTBOUND/RETURN_MS。
  * 舵机是直接给 PWM 目标角、按自身速度走, 所以缩短等待不改变升降速度,
  * 但若实测 1s 走不完 0°→120°, 这里必须跟着加大, 否则斗还没到位就反向。 */
-#define BUCKET_LIFT_DURATION_MS          1000U
-#define BUCKET_LOWER_DURATION_MS         1000U
+#define BUCKET_LIFT_DURATION_MS          1200U
+#define BUCKET_LOWER_DURATION_MS         1200U
 /*
  * 升到顶后的振颤: 在 BUCKET_START_DEG 与 BUCKET_END_DEG 之间全行程来回下指令,
  * 靠反复启停的冲击把卡在斗底或门边的物块震松 —— 停在顶端不会让它自己滑出去。
@@ -561,20 +607,29 @@ typedef struct {
 #define BUCKET_DOOR_CLOSE_MS             500U   /* 等门关到位 */
 #define UNLOAD_REPEAT_COUNT              2U
 /*
- * 两轮升降之间的挪位, 同时也是下一轮 (0,0) 的取点: 挪完的落脚处就是第二次
- * 卸货的位置, 离真实卸货点最近, 作为下一轮返航目标最合适。
- * 0.5s × 17.25 ≈ 9cm, 只够错开一个车身宽度以内, 不会跑出卸货区。
+ * 两轮振颤之间的挪位, 让第二轮卸在稍微错开的位置, 免得物块都堆在同一点上互相
+ * 挡住出口。0.85s × 17.25 ≈ 15cm, 一个车身宽以内, 不会跑出卸货区。
+ *
+ * 速度单独一个宏, 不跟 UNLOAD_EXIT_SPEED_CM_S 共用: 驶离段要的是尽快脱开黑区,
+ * 挪位段要的是小步错开落点, 两者的量级需求相反。挪位取与倒车段同速 (17.25),
+ * 正好和倒进来的 43cm 同一个尺度, 不会一步把车推出卸货区。
+ *
+ * 与返航原点无关: 下一轮的 (0,0) 在第一轮振颤结束、挪位之前就建好了 (见
+ * motion_strategy.c 的 UNLOADING step5), 所以改这个时长只改第二轮的落点,
+ * 不会连带把下一轮的家往前推。
  */
-#define UNLOAD_MID_FORWARD_MS            750U
+#define UNLOAD_MID_FORWARD_MS            850U
+#define UNLOAD_MID_SPEED_CM_S            HOME_BACKUP_SPEED_CM_S
 /*
  * 卸完货开出黑区再进下一轮: 车尾还压在卸货区上, 直接原地起转会把刚倒出来
  * 的物块扫散。走弧线朝左前方离开, 结束时车头已偏左 UNLOAD_EXIT_TURN_DEG,
  * 下一轮搜索的起始朝向与上一轮不同, 不会反复扫同一片区域。
- * 速度取与 HOME_DONE 倒车段相同; 2.5s 约 43cm 弧长, 回转半径约 55cm。
- * 同样是开环: 本状态不做蓝墙退避, 前方有墙不会被察觉。
+ * 35cm/s × 2.5s 约 87cm 弧长, 45°折算回转半径约 111cm。取比倒车段 (17.25) 快
+ * 一倍是为了尽快脱开黑区: 车尾拖在卸货区上的时间越长, 越容易把物块带走。
+ * 同样是开环: 本状态不做蓝墙退避, 前方有墙不会被察觉, 所以别再往上加时长。
  */
 #define UNLOAD_EXIT_FORWARD_MS           2500U
-#define UNLOAD_EXIT_SPEED_CM_S           HOME_BACKUP_SPEED_CM_S
+#define UNLOAD_EXIT_SPEED_CM_S           35.0f
 #define UNLOAD_EXIT_TURN_DEG             45.0f  /* 整段累计左偏角, 原 30 */
 /* 摊到整段上的转速; 改上面两个值时自动跟随。调用处取正 = 左转 (逆时针)。 */
 #define UNLOAD_EXIT_TURN_DEG_S \

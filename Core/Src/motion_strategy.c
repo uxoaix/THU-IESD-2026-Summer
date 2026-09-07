@@ -9,6 +9,9 @@
 static MotionState_t s_state;
 static uint32_t s_state_ms;
 static uint32_t s_missing_ms;
+/* 连续看见目标的时长, s_missing_ms 的互补量。扫视阶段用它去抖, 见
+ * motion_config.h §7 SEARCH_DETECT_CONFIRM_MS。 */
+static uint32_t s_seen_ms;
 static uint32_t s_tracking_forward_ms;
 static uint8_t s_collected;
 /* 1=视觉目标切换成黑色卸货区 (返航后), 0=找红/黄物块。
@@ -54,6 +57,10 @@ static uint8_t s_scan_table_valid;
  * 重新对准时沿用同一个目标，不会因为车身转过了就改主意。 */
 static float s_relocate_heading;
 static uint8_t s_relocate_valid;
+/* 滚刷已放行搜索, 等其 0→180→0 整段 IDLE 后再发后斗 cycle。 */
+static uint8_t s_pending_bucket_after_brush;
+/* 黑区掉头前连续对准的时长, 达到 BLACK_TURN_ALIGN_CONFIRM_MS 才允许掉头。 */
+static uint32_t s_align_confirm_ms;
 
 static float AbsF(float x) { return x < 0.0f ? -x : x; }
 
@@ -146,6 +153,7 @@ static void Enter(MotionState_t state)
   }
   if (state == MOTION_STATE_BLACK_AREA_TRACK) {
     s_arrive_confirm_ms = 0U;
+    s_align_confirm_ms = 0U;
   }
   /*
    * 纠缠计时只在"退避 <-> 被打断的状态"之间往返时保留；真正换了阶段就说明
@@ -160,6 +168,12 @@ static void Enter(MotionState_t state)
 static void ResumeSearch(void)
 {
   s_missing_ms = 0U;
+  /*
+   * 发现计时重新起算: PRE_CENTERING 因 2s 超时退出时目标往往还在视野里, 若沿用
+   * 已攒满的计时会同一周期又跳回去, 在"对准超时 <-> 扫视"之间空转。清零等于要求
+   * 先扫够 SEARCH_DETECT_CONFIRM_MS 再重试。目标真丢的那条路本来就是 0, 无影响。
+   */
+  s_seen_ms = 0U;
   Enter(s_wall_black ? MOTION_STATE_BLACK_AREA_SEARCH
                      : MOTION_STATE_ROTATE_SEARCH);
 }
@@ -329,6 +343,7 @@ void MotionStrategy_Init(void)
   uint8_t i;
   s_state = MOTION_STATE_INIT;
   s_state_ms = s_missing_ms = 0U;
+  s_seen_ms = 0U;
   s_tracking_forward_ms = 0U;
   s_collected = s_wall_black = 0U;
   s_black_target = 0U;
@@ -344,6 +359,7 @@ void MotionStrategy_Init(void)
   s_backoff_return_state = MOTION_STATE_ROTATE_SEARCH;
   s_wall_clear_ms = 0U;
   s_arrive_confirm_ms = 0U;
+  s_align_confirm_ms = 0U;
   s_unload_cycles = 0U;
   s_unload_shakes = 0U;
   s_wall_struggle_ms = 0U;
@@ -353,6 +369,7 @@ void MotionStrategy_Init(void)
   ScanTableReset(0.0f);
   s_relocate_heading = 0.0f;
   s_relocate_valid = 0U;
+  s_pending_bucket_after_brush = 0U;
   for (i = 0U; i < WHEEL_COUNT; i++) s_prev_target[i] = 0.0f;
   ImuOdometry_Init();
 }
@@ -363,12 +380,14 @@ void MotionStrategy_Stop(void)
   s_state_ms = 0U;
   s_action_step = 0U;
   s_missing_ms = 0U;
+  s_seen_ms = 0U;
   s_wall_struggle_ms = 0U;
   s_wall_struggle_active = 0U;
   s_search_ms = 0U;
   s_home_seen_ms = 0U;
   s_relocate_valid = 0U;
   s_scan_table_valid = 0U;
+  s_pending_bucket_after_brush = 0U;
 }
 
 void MotionStrategy_RequestRotateCw(float target_deg)
@@ -406,6 +425,20 @@ void MotionStrategy_Update(const VisionData_t *vision,
   out->camera_cycle = 0U;
   out->detect_black_area = s_black_target;
 
+  /*
+   * 滚刷整段 0→180→0 结束后才发后斗。pending 一直保持到后斗 IsBusy 为止,
+   * 避免"本周期脉冲已发、Apply 还没跑、IsBusy 仍为 0"的空隙里又进下一次收集。
+   */
+  if (s_pending_bucket_after_brush &&
+      !ActuatorServos_IsBusy(ACTUATOR_SERVO_BRUSH)) {
+    if (!ActuatorServos_IsBusy(ACTUATOR_SERVO_BUCKET)) {
+      out->bucket_cycle = 1U;
+    }
+    if (ActuatorServos_IsBusy(ACTUATOR_SERVO_BUCKET)) {
+      s_pending_bucket_after_brush = 0U;
+    }
+  }
+
   ImuOdometry_Update(wheels, dt);
   /*
    * 全车只有这一个航向来源: 融合航向 (编码器 + IMU, 见 sensor_fusion)。
@@ -420,12 +453,18 @@ void MotionStrategy_Update(const VisionData_t *vision,
   wanted_detected = vision->detected &&
     ((s_black_target && vision->object_type == BLACK_AREA_OBJECT_TYPE) ||
      (!s_black_target && vision->object_type != BLACK_AREA_OBJECT_TYPE));
-  if (wanted_detected) s_missing_ms = 0U;
-  else s_missing_ms += elapsed_ms;
+  /* s_seen_ms 与 s_missing_ms 互补: 一个记连续看见多久, 一个记丢了多久。 */
+  if (wanted_detected) {
+    s_missing_ms = 0U;
+    s_seen_ms += elapsed_ms;
+  } else {
+    s_missing_ms += elapsed_ms;
+    s_seen_ms = 0U;
+  }
 
   /*
    * 距上次滚刷收集成功的时长，见 motion_config.h §7 SEARCH_GIVE_UP_MS。
-   * 只在 BRUSH_COLLECT 走完整套动作、s_collected 真的加一时才清零——衡量的
+   * 只在 BRUSH_COLLECT 滚刷去程到位、s_collected 真的加一时才清零——衡量的
    * 是"有没有真的收到物块"，不是"有没有看见物块"。看见就清零的话，车反复
    * 盯着一个够不到的物块、或者每次追踪都在最后丢失，计时会被无限推迟。
    * 收集阶段全程累加，所以卡在 PRE_CENTERING/TARGET_TRACKING 的往复里也会
@@ -569,7 +608,8 @@ void MotionStrategy_Update(const VisionData_t *vision,
     }
     ScanTableRecord(vwall, heading);
 #if OBJECT_APPROACH_TEST_MODE
-    if (wanted_detected) {
+    /* 要连续看见 SEARCH_DETECT_CONFIRM_MS 才交给对准，单帧误检不打断扫视。 */
+    if (s_seen_ms >= SEARCH_DETECT_CONFIRM_MS) {
       Enter(MOTION_STATE_PRE_CENTERING);
     } else if (BackoffIfWallSeen(vwall, out)) {
       /* 已转入退避，本周期不再输出其他动作。 */
@@ -592,7 +632,7 @@ void MotionStrategy_Update(const VisionData_t *vision,
                    -DEG_TO_RAD(SEARCH_SWEEP_ANGULAR_DEG_S), out);
     }
 #else
-    if (wanted_detected) {
+    if (s_seen_ms >= SEARCH_DETECT_CONFIRM_MS) {
       Enter(MOTION_STATE_PRE_CENTERING);
     } else if (BackoffIfWallSeen(vwall, out)) {
       /* 已转入退避。 */
@@ -700,21 +740,41 @@ void MotionStrategy_Update(const VisionData_t *vision,
      * 上边缘裁切时同样读出接近 0 的值，会让车一看到黑区就地掉头；面积比
      * 远则小近则大，没有这个歧义。
      * A 帧本身没有迟滞，所以要求连续 BLACK_ARRIVE_CONFIRM_MS 都报到位。
+     * 到位后还要 |水平对准误差| ≤ BLACK_TURN_ALIGN_MAX_PX 连续
+     * BLACK_TURN_ALIGN_CONFIRM_MS 才掉头；否则原地拧到对准（与 PRE_CENTERING
+     * 同套模糊+静摩擦下限），避免歪着卸货。门限与模糊死区的关系见配置说明。
      * 链路断了时 valid=0 且 arrived=0，走目标丢失分支回搜索，不会误卸货。
      * 本状态不做蓝墙退避——黑区就贴着墙，退避会让它永远卸不了货。
      */
     if (!wanted_detected) {
       if (s_missing_ms >= TARGET_LOCK_WINDOW_MS) ResumeSearch();
     } else {
+      int16_t align_err = GetAlignmentError(vision->x_offset_px);
+
       if (arrival->valid && arrival->arrived) {
         s_arrive_confirm_ms += elapsed_ms;
       } else {
         s_arrive_confirm_ms = 0U;
       }
+      /*
+       * 对准计时整段累加，不等到位后才起算：边走边追时车持续对中，到位那一刻
+       * 通常已经攒满，正常情况不会多等一次 CONFIRM；真歪了才需要拧到位再稳住。
+       */
+      if (AbsF((float)align_err) <= (float)BLACK_TURN_ALIGN_MAX_PX) {
+        s_align_confirm_ms += elapsed_ms;
+      } else {
+        s_align_confirm_ms = 0U;
+      }
 
       if (s_arrive_confirm_ms >= BLACK_ARRIVE_CONFIRM_MS) {
-        BeginRotateCw(heading, HOME_TURN_AROUND_TARGET_DEG);
-        Enter(MOTION_STATE_HOME_TURN_AROUND);
+        if (s_align_confirm_ms >= BLACK_TURN_ALIGN_CONFIRM_MS) {
+          BeginRotateCw(heading, HOME_TURN_AROUND_TARGET_DEG);
+          Enter(MOTION_STATE_HOME_TURN_AROUND);
+        } else {
+          /* 已压到黑区上但对不齐: 停住原地拧，不再往前拱。 */
+          Motion_Rotate(ApplyTurnFloor(
+            BlockAlignment_GetAngularCorrection(align_err)), out);
+        }
       } else {
         TrackTargetWhileMoving(vision, out);
       }
@@ -728,7 +788,15 @@ void MotionStrategy_Update(const VisionData_t *vision,
      */
     if (s_state_ms >= FINAL_APPROACH_DURATION_MS) {
       Motion_StopOutput(out);
-      Enter(MOTION_STATE_BRUSH_COLLECT);
+      /*
+       * 后斗未落到位、或还在等滚刷回程后启斗、或上一次滚刷还在回程时,
+       * 不进下一次收集 (TriggerCycle 在非 IDLE 时会直接丢弃)。
+       */
+      if (!s_pending_bucket_after_brush &&
+          !ActuatorServos_IsBusy(ACTUATOR_SERVO_BUCKET) &&
+          !ActuatorServos_IsBusy(ACTUATOR_SERVO_BRUSH)) {
+        Enter(MOTION_STATE_BRUSH_COLLECT);
+      }
     } else {
       Motion_Line(TRACKING_LINEAR_SPEED_CM_S * TRACKING_SLOW_RATIO, out);
     }
@@ -736,41 +804,32 @@ void MotionStrategy_Update(const VisionData_t *vision,
 
   case MOTION_STATE_BRUSH_COLLECT:
     /*
-     * 只等滚刷走完就走，后斗升降与下一轮搜索并行。
-     *
-     * 能这么做是因为舵机模块是自治的：TriggerCycle 只设一次目标角并起计时，
-     * 之后 AT_END → RETURNING → IDLE 由主循环里的 ActuatorServos_Run() 自己
-     * 推进，与运动状态机无关。所以发完指令就能转下一轮，升降会在搜索/对准
-     * 的过程中自行完成，省下原来干等后斗的约 2s。
-     * cycle 标志是一次性脉冲（Update 开头统一清零），本周期设上就会被紧随
-     * 其后的 ActuatorServos_Apply 消费，同周期 Enter() 不影响它生效。
+     * 滚刷 0→180 到位即转 SEARCH_CONTINUE; 回程与后斗都在后台:
+     *   pending 在去程结束时置位 → 滚刷 IDLE 后 Update 开头发 bucket_cycle。
+     * 入口再挡一次: 若后斗仍忙则先停着等 (与 FINAL_APPROACH 闸门双保险)。
      */
     Motion_StopOutput(out);
     if (s_action_step == 0U) {
+      if (s_pending_bucket_after_brush ||
+          ActuatorServos_IsBusy(ACTUATOR_SERVO_BUCKET) ||
+          ActuatorServos_IsBusy(ACTUATOR_SERVO_BRUSH)) {
+        break;
+      }
       out->brush_cycle = 1U;
       s_action_step = 1U;
     } else if (s_action_step == 1U &&
                ActuatorServos_IsBusy(ACTUATOR_SERVO_BRUSH)) {
       s_action_step = 2U;
     } else if (s_action_step == 2U &&
-               !ActuatorServos_IsBusy(ACTUATOR_SERVO_BRUSH)) {
-      s_state_ms = 0U;
-      s_action_step = 3U;
-    } else if (s_action_step == 3U &&
-               s_state_ms >= COLLECT_BUCKET_DELAY_MS) {
-      /*
-       * 发后斗指令并立即转下一轮。滚刷已经走完、物块已被扫进来，所以这里
-       * 就是"收到一个"的真实节点，计数和搜索计时都在这一刻更新。
-       */
-      out->bucket_cycle = 1U;
+               ActuatorServos_IsReturning(ACTUATOR_SERVO_BRUSH)) {
+      /* 去程结束 (已到 180、开始回 0): 放行搜索, 记一笔, 等回程后再升斗。 */
+      s_pending_bucket_after_brush = 1U;
       s_collected++;
-      /* 唯一的清零点：滚刷成功走完才算一次真实进度。下面的超时分支不清零，
-       * 那条路没收到东西。 */
       s_search_ms = 0U;
       Enter(MOTION_STATE_SEARCH_CONTINUE);
     }
-    /* 兜底只覆盖滚刷段：后斗已不占用本状态的时间。 */
-    if (s_state_ms >= BRUSH_TIMEOUT_MS + COLLECT_BUCKET_DELAY_MS) {
+    if (s_state_ms >= BRUSH_TIMEOUT_MS) {
+      /* 去程没到位: 不加计数、不挂 pending, 直接回搜索。 */
       Enter(MOTION_STATE_SEARCH_CONTINUE);
     }
     break;
@@ -975,27 +1034,32 @@ void MotionStrategy_Update(const VisionData_t *vision,
       } else {
         /* MOVES 是偶数，一轮颤完斗停在抬起那一侧，落斗留到最后统一做。 */
         s_unload_cycles++;
+        if (s_unload_cycles == 1U) {
+          /*
+           * 下一轮的(0,0)取在第一轮振颤结束、挪位之前的这个点：第一轮的物块就
+           * 卸在车此刻的位置上，比挪完 UNLOAD_MID_FORWARD_MS 之后更贴近真实
+           * 卸货点，也不会随那段时长的调整而漂移。此刻车是停着的（本状态每周期
+           * 都先 Motion_StopOutput，振颤期间不给轮子指令），位置读数干净。
+           * 用 MoveOriginHere() 而不是 SetHome()：后者会把融合航向清零，而返航
+           * 靠绝对航向定方向，中途清一次航向基准就失效了；位置清零本身只影响
+           * home_x/home_y 遥测，不参与返航决策。
+           */
+          ImuOdometry_MoveOriginHere();
+        }
         /* 还有下一轮就先挪一小段(step6)，颤完了就落斗(step8)。 */
         s_action_step = (s_unload_cycles < UNLOAD_REPEAT_COUNT) ? 6U : 8U;
       }
       s_state_ms = 0U;
     } else if (s_action_step == 6U) {
-      /* 两轮振颤之间挪位，让第二轮卸在稍微错开的位置；斗保持抬起。 */
+      /* 两轮振颤之间挪位，让第二轮卸在稍微错开的位置；斗保持抬起。
+       * 下一轮的原点已在进本步之前建好（见 step5），所以这段挪位的距离不会
+       * 计进返航目标里。 */
       if (s_state_ms >= UNLOAD_MID_FORWARD_MS) {
         Motion_StopOutput(out);
-        if (s_unload_cycles == 1U) {
-          /*
-           * 第二次卸货的落脚点定为下一轮的(0,0)：这里离真实卸货点最近。
-           * 用 MoveOriginHere() 而不是 SetHome()：后者会把融合航向清零，
-           * 而返航靠开机锁存的绝对航向定方向，中途清一次航向基准就失效了。
-           * 位置清零本身只影响 home_x/home_y 遥测，不参与返航决策。
-           */
-          ImuOdometry_MoveOriginHere();
-        }
         s_action_step = 7U;
         s_state_ms = 0U;
       } else {
-        Motion_Line(UNLOAD_EXIT_SPEED_CM_S, out);
+        Motion_Line(UNLOAD_MID_SPEED_CM_S, out);
       }
     } else if (s_action_step == 7U && s_state_ms >= BUCKET_LIFT_DURATION_MS) {
       /*

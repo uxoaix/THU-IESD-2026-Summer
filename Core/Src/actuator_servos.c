@@ -163,6 +163,15 @@ uint8_t ActuatorServos_IsBusy(ActuatorServoId_t servo)
   return (s_servo[servo].state != SERVO_CYCLE_IDLE) ? 1U : 0U;
 }
 
+uint8_t ActuatorServos_IsReturning(ActuatorServoId_t servo)
+{
+  if ((uint8_t)servo >= ACTUATOR_SERVO_COUNT)
+  {
+    return 0U;
+  }
+  return (s_servo[servo].state == SERVO_CYCLE_RETURNING) ? 1U : 0U;
+}
+
 uint8_t ActuatorServos_SetAngle(ActuatorServoId_t servo_id,
                                 uint16_t angle_deg)
 {
